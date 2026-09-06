@@ -1,0 +1,10 @@
+# Ignore
+.DS_Store
+*.db
+*.exe
+*.test
+*.out
+vendor/
+.idea/
+.vscode/
+*.swp
