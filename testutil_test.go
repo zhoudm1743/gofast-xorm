@@ -1,6 +1,10 @@
 package xormdriver
 
 import (
+	"context"
+	"fmt"
+	"strings"
+	"sync"
 	"testing"
 
 	"github.com/zhoudm1743/go-fast-framework/contracts"
@@ -17,6 +21,23 @@ func newXormTestDriver(t *testing.T) *XormDriver {
 		t.Fatalf("创建测试数据库失败: %v", err)
 	}
 	return &XormDriver{engine: engine}
+}
+
+// newXormTestDriverWithIdentifier 创建指定 tag_identifier 的内存 SQLite 测试驱动
+// （统一 orm tag 体系 U5/U7 基建）：identifier 非 "xorm"/"" 时按 NewXormDriver
+// 的配置链路调用 engine.SetTagIdentifier 切换引擎读取的 tag 键，并挂接捕获型
+// 日志器，返回驱动与其日志捕获器（供启动期告警断言）。
+func newXormTestDriverWithIdentifier(t *testing.T, identifier string) (*XormDriver, *captureLog) {
+	t.Helper()
+	engine, err := xorm.NewEngine("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("创建测试数据库失败: %v", err)
+	}
+	if identifier != "" && identifier != "xorm" {
+		engine.SetTagIdentifier(identifier)
+	}
+	log := newCaptureLog()
+	return &XormDriver{engine: engine, tagIdentifier: identifier, log: log}, log
 }
 
 // newXormTestDriverWithModel 带普通测试模型表（XormTestModel → xorm_test_model）的驱动。
@@ -170,3 +191,52 @@ func countRaw(t *testing.T, drv *XormDriver, sql string) int64 {
 	}
 	return n
 }
+
+// ── 捕获型日志器（orm tag 启动期校验告警断言用）──────────────────────
+
+// captureLog 测试用 contracts.Log：按级别缓冲格式化后的日志文本，
+// 供 AutoMigrate 启动期校验（ormtag_check.go）的 Warn 断言使用。
+// xorm 引擎日志桥接（fastLogger）也会并发写入，故加互斥保护。
+type captureLog struct {
+	mu    sync.Mutex
+	lines map[string][]string // 级别（debug/info/warn/error/...）→ 消息列表
+}
+
+func newCaptureLog() *captureLog {
+	return &captureLog{lines: make(map[string][]string)}
+}
+
+func (l *captureLog) append(level, msg string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.lines[level] = append(l.lines[level], msg)
+}
+
+// has 判断指定级别的日志中是否存在包含 substr 的消息。
+func (l *captureLog) has(level, substr string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, s := range l.lines[level] {
+		if strings.Contains(s, substr) {
+			return true
+		}
+	}
+	return false
+}
+
+func (l *captureLog) Debug(args ...any)                         { l.append("debug", fmt.Sprint(args...)) }
+func (l *captureLog) Debugf(format string, a ...any)            { l.append("debug", fmt.Sprintf(format, a...)) }
+func (l *captureLog) Info(args ...any)                          { l.append("info", fmt.Sprint(args...)) }
+func (l *captureLog) Infof(format string, a ...any)             { l.append("info", fmt.Sprintf(format, a...)) }
+func (l *captureLog) Warn(args ...any)                          { l.append("warn", fmt.Sprint(args...)) }
+func (l *captureLog) Warnf(format string, a ...any)             { l.append("warn", fmt.Sprintf(format, a...)) }
+func (l *captureLog) Error(args ...any)                         { l.append("error", fmt.Sprint(args...)) }
+func (l *captureLog) Errorf(format string, a ...any)            { l.append("error", fmt.Sprintf(format, a...)) }
+func (l *captureLog) Fatal(args ...any)                         { l.append("fatal", fmt.Sprint(args...)) }
+func (l *captureLog) Fatalf(format string, a ...any)            { l.append("fatal", fmt.Sprintf(format, a...)) }
+func (l *captureLog) Panic(args ...any)                         { l.append("panic", fmt.Sprint(args...)) }
+func (l *captureLog) Panicf(format string, a ...any)            { l.append("panic", fmt.Sprintf(format, a...)) }
+func (l *captureLog) WithField(string, any) contracts.Log       { return l }
+func (l *captureLog) WithFields(map[string]any) contracts.Log   { return l }
+func (l *captureLog) WithError(error) contracts.Log             { return l }
+func (l *captureLog) WithContext(context.Context) contracts.Log { return l }

@@ -231,10 +231,9 @@ func (q *XormQuery) FirstOrCreate(dest any, conds ...any) error {
 	if err := invokeBeforeCreate(q, dest); err != nil {
 		return q.done(err)
 	}
-	s2, err := q.build(dest)
-	if err != nil {
-		return q.done(err)
-	}
+	// 插入会话不带链上条件（xorm 携带 Where 的 Insert 静默影响 0 行，见
+	// createCore 注释）；gorm 的 FirstOrCreate 创建路径同样不回填条件。
+	s2 := q.buildInsertSession(dest)
 	if _, err := s2.Insert(dest); err != nil {
 		return q.done(err)
 	}

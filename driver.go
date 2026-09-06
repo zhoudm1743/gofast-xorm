@@ -73,12 +73,35 @@ func NewXormDriver(cfg contracts.ConnectionConfig, log contracts.Log) (*XormDriv
 	if cfg.TablePrefix != "" {
 		engine.SetTableMapper(names.NewPrefixMapper(names.SnakeMapper{}, cfg.TablePrefix))
 	}
+	// PostgreSQL 多租户（U18 集成回归发现）：xorm postgres 方言的 DDL（Sync2
+	// 建表/改列/索引）以 URI().Schema 限定表名，缺省回退 "public"——事务内
+	// SET LOCAL search_path 改变不了它的落点。将连接配置的 Schema 同步给引擎，
+	// 保证 AutoMigrate 在正确 schema 建表；DML 侧 schemaTable 已拼前缀的表名
+	// 含 "."，xorm 不会重复追加。
+	if cfg.Schema != "" && cfg.Engine == "postgres" {
+		engine.SetSchema(cfg.Schema)
+	}
 	// 列名映射（X-02）：默认 GonicMapper（xorm 原生，常用缩写不加下划线，
 	// DeptID→dept_id、ID→id，与 GORM NamingStrategy 同一套缩写规则），保证
 	// 同一模型在 gorm/xorm 两驱动下列名一致；表名仍为 SnakeMapper 单数。
 	// naming: "snake" 回退 SnakeMapper 逐字下划线行为（DeptID→dept_i_d）。
 	if cfg.Naming != "snake" {
 		engine.SetColumnMapper(names.GonicMapper{})
+	}
+
+	// 统一模型标签接入（orm-tag-design.md §8.2）：tag_identifier 配置切换引擎
+	// 读取的 struct tag 键名（官方公开 API，引擎级全局生效）。默认 "xorm" 保持
+	// 现状；置 "orm" 后该连接所有模型的 orm tag 由 xorm 原生解析（建表/CRUD/
+	// created/updated/extends/忽略全部原生行为），xorm:"..." tag 同连接失效。
+	// 注意必须在首次 TableInfo/Sync2 之前设置（tagParser 决定列元数据推导）。
+	if cfg.TagIdentifier != "" && cfg.TagIdentifier != "xorm" {
+		engine.SetTagIdentifier(cfg.TagIdentifier)
+	}
+	// 有效 identifier（空配置归一为 "xorm"）：AutoMigrate 启动期校验（§10.3 陷阱
+	// 告警）与 Preload 忽略标记判定均按它走。
+	tagIdentifier := cfg.TagIdentifier
+	if tagIdentifier == "" {
+		tagIdentifier = "xorm"
 	}
 
 	// 桥接框架日志器：SQL 执行日志、慢查询与 xorm 内部日志统一走框架日志器，
@@ -104,7 +127,7 @@ func NewXormDriver(cfg contracts.ConnectionConfig, log contracts.Log) (*XormDriv
 		return nil, fmt.Errorf("[GoFast] xormdriver driver: database ping failed: %w", err)
 	}
 
-	return &XormDriver{engine: engine, schema: cfg.Schema, tablePrefix: cfg.TablePrefix}, nil
+	return &XormDriver{engine: engine, schema: cfg.Schema, tablePrefix: cfg.TablePrefix, tagIdentifier: tagIdentifier, log: log}, nil
 }
 
 // Query 创建新的查询构建器实例；可传入 context 用于超时/取消与链路追踪。
@@ -130,9 +153,15 @@ func (d *XormDriver) Ping() error {
 func (d *XormDriver) Close() error { return d.engine.Close() }
 
 // AutoMigrate 根据 struct 自动建表/迁移。
+// 启动期校验先于 Sync2 执行（ormtag_check.go，orm-tag-design.md §8.4/§10.3）：
+// 禁用 token/未知裸 token/非法 orm tag 语法直接报错（启动即失败），ext 中 xorm
+// 不支持项与 identifier 陷阱只告警不中断。
 // PostgreSQL 多租户：在事务内显式 SET LOCAL search_path，确保 DDL 在正确的 schema
 // 执行，不依赖连接池的 DSN 初始化值（xorm 事务签名为 func(*Session) (any, error)）。
 func (d *XormDriver) AutoMigrate(models ...any) error {
+	if err := d.validateOrmTags(models); err != nil {
+		return err
+	}
 	if d.schema == "" {
 		return d.engine.Sync2(models...)
 	}

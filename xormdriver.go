@@ -14,10 +14,14 @@
 //   - Query().Cache() 查询结果缓存：需先通过 dbManager.UseQueryCache 启用
 //     （驱动实现 contracts.QueryCacher）；JSON 序列化语义；写操作自动失效。
 //   - TxOption（隔离级别）：xorm 的 session.Begin() 无选项参数，当前降级为忽略。
-//   - Preload()：xorm 无关联元数据（association tag），以外键解析（gorm tag
-//     foreignKey/references 优先，缺省多列约定 <父表名>_<主键列>）+ 反射回填
-//     实现（详见 query_preload.go）；Debug()/Lock(LockShareMode)：xorm 无对应
-//     能力，文档化 no-op。
+//   - 统一模型标签（orm tag）：连接配置 tag_identifier 切换引擎读取的 tag 键
+//     （默认 "xorm"，置 "orm" 启用统一标签，§8.1/§8.2）；AutoMigrate 启动期
+//     校验禁用 token/未知裸 token（§8.4）并对迁移期陷阱/ ext 降级告警（§10.3，
+//     见 ormtag_check.go）。
+//   - Preload()：切换到框架级共享 Preload 引擎（database/preload，契约 §9.2），
+//     驱动侧仅保留 MetaAdapter/子查询构造薄包装；关联解析覆盖 rel tag → gorm
+//     tag → 约定 → 方向判定 → many2many → polymorphic 全链（query_preload.go）。
+//     Debug()/Lock(LockShareMode)：xorm 无对应能力，文档化 no-op。
 package xormdriver
 
 import (
@@ -36,10 +40,12 @@ import (
 
 // XormDriver 实现 contracts.Driver（方法见 driver.go / cacher.go）。
 type XormDriver struct {
-	engine      *xorm.Engine
-	schema      string      // 连接级默认 schema（cfg.Schema）
-	tablePrefix string      // 表名前缀（cfg.TablePrefix）
-	qc          *queryCache // 查询缓存；EnableCaches 后非 nil（见 cacher.go）
+	engine        *xorm.Engine
+	schema        string        // 连接级默认 schema（cfg.Schema）
+	tablePrefix   string        // 表名前缀（cfg.TablePrefix）
+	tagIdentifier string        // 引擎读取的 struct tag 键名（cfg.TagIdentifier，空值归一为 "xorm"）
+	qc            *queryCache   // 查询缓存；EnableCaches 后非 nil（见 cacher.go）
+	log           contracts.Log // 框架日志器（AutoMigrate 启动期校验告警用；构造时 nil 已降级 discardLog）
 }
 
 // ── 查询构建器 ───────────────────────────────────────────────────────

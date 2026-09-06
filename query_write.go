@@ -28,6 +28,10 @@ import (
 // 返回 Insert 的受影响行数供 CreateResult 回填；Create 丢弃行数只取错误。
 // 注意 gorm 驱动的 Save 空主键分支同样先落 gorm BeforeCreate 生成 ID，
 // saveOne 的插入路径复用本函数即与该语义对齐。
+//
+// 此处沿用 q.build(value)（保留链上条件）：Save 的 0 行回落插入依赖显式
+// 条件过滤回落行（TestXormSaveResultWithExplicitCond 锁定）——故条件剥离
+// 仅用于 FirstOrCreate 的插入路径（buildInsertSession），不动本函数。
 func (q *XormQuery) createCore(value any) (int64, error) {
 	if err := invokeBeforeCreate(q, value); err != nil {
 		return 0, q.done(err)
@@ -43,6 +47,32 @@ func (q *XormQuery) createCore(value any) (int64, error) {
 	// 写操作成功后统一失效查询缓存（契约约定 5）
 	q.invalidateCache()
 	return n, q.done(invokeAfterCreate(q, value))
+}
+
+// buildInsertSession 为 FirstOrCreate 的插入路径构造会话：复用事务会话/上下文
+// 与表名（显式表名 → dest 推导兜底，schema 前缀经 schemaTable），不应用链上
+// Where/Limit/Order——xorm session 携带 Where 条件时 Insert 会静默影响 0 行且
+// 不报错（一致性套件 U17 发现，FirstOrCreate 未命中路径曾因此丢数据）。
+func (q *XormQuery) buildInsertSession(value any) *xorm.Session {
+	var s *xorm.Session
+	if q.tx != nil {
+		s = q.tx
+	} else {
+		s = q.engine.NewSession()
+		if q.ctx != nil {
+			s = s.Context(q.ctx)
+		}
+	}
+	name := q.tableName
+	if name == "" && value != nil {
+		if n, err := tableInfoName(q.engine, value); err == nil {
+			name = n
+		}
+	}
+	if name != "" {
+		s.Table(q.schemaTable(name))
+	}
+	return s
 }
 
 // Create 插入单条记录。
