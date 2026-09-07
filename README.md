@@ -50,6 +50,15 @@ database:
 - `Exists` / `FirstOrCreate` / `FirstOrInit` 与 `First`/`Last`/`Take`/`Scan`
   口径一致：dest 的非零字段**不会**并入查询条件，查询范围只由链上
   `Where`/conds 决定；`FirstOrCreate` 未命中时按 dest 原值插入。
+- `Having` 带参占位符：链上拒绝（`ErrUnsupported`）——gorm 驱动支持，
+  双驱动差异固化（fullcov_chain `Having过滤`）。
+- `Joins` 非法串：链上报 `ErrUnsupported`——gorm 驱动透传数据库原始错误。
+- Save 双分支钩子：空主键走 Create 系钩子、非空主键走 Update 系钩子
+  （gorm 驱动统一只触发 Update 系——双驱动差异固化，hooks_integration_test）。
+- 超时/连接失败哨兵：statement_timeout(57014)/max_execution_time(3024) →
+  `ErrQueryTimeout`；连接失败 → `ErrConnFailed`（fault_integration_test 实测锁定）。
+
+双驱动联合测试方案与执行报告：`../docs/md/dual-driver-test-plan.md`。
 
 ## 依赖
 

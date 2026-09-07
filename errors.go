@@ -42,6 +42,14 @@ func wrapError(err error) error {
 		strings.Contains(msg, "23505") || strings.Contains(msg, "Error 1062") {
 		return fmt.Errorf("%w: %v", contracts.ErrDuplicatedKey, err)
 	}
+	// 查询超时（L4 故障矩阵 ERR-05，2026-09-08 此前无映射为驱动缺陷）：
+	// PostgreSQL statement_timeout 触发（SQLSTATE 57014，"canceling statement
+	// due to statement timeout"）；MySQL max_execution_time 触发（Error 3024，
+	// "Query execution was interrupted, maximum statement execution time exceeded"）
+	if strings.Contains(msg, "statement timeout") || strings.Contains(msg, "57014") ||
+		strings.Contains(msg, "maximum statement execution time") || strings.Contains(msg, "Error 3024") {
+		return fmt.Errorf("%w: %v", contracts.ErrQueryTimeout, err)
+	}
 	// 其余错误不属于框架语义范畴，原样透传以保留底层原始上下文
 	return err
 }

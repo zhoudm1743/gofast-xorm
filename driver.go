@@ -124,7 +124,9 @@ func NewXormDriver(cfg contracts.ConnectionConfig, log contracts.Log) (*XormDriv
 	defer cancel()
 	if err := engine.PingContext(ctx); err != nil {
 		_ = engine.Close()
-		return nil, fmt.Errorf("[GoFast] xormdriver driver: database ping failed: %w", err)
+		// 连接失败归一（L4 故障矩阵 ERR-06，2026-09-08 此前原样透出为驱动缺陷）：
+		// 多 %w 包装（Go 1.20+）同时保留底层错误链，errors.Is 可命中两个错误
+		return nil, fmt.Errorf("[GoFast] xormdriver driver: database ping failed: %w: %w", err, contracts.ErrConnFailed)
 	}
 
 	return &XormDriver{engine: engine, schema: cfg.Schema, tablePrefix: cfg.TablePrefix, tagIdentifier: tagIdentifier, log: log}, nil
