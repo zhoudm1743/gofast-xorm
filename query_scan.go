@@ -36,6 +36,8 @@ var (
 // 场景，xorm 的 GenGetSQL/GenFindSQL 在 statement.RawSQL 非空时直接返回原生
 // SQL，故链式与 Raw 统一适用），否则（如 *[]T、*[]*T）走 Find。
 // Get 返回 found=false 表示无记录，dest 保持零值属正常语义，不视为错误。
+// 与 First/Last/Take 同一口径（getOne）：Get 前置 NoAutoCondition，dest 非空
+// 字段不作为自动条件（MergeConds），dest 复用不会静默收窄查询范围。
 func (q *XormQuery) Scan(dest any) error {
 	err := q.withCache(dest, func() error {
 		s, err := q.build(dest)
@@ -53,6 +55,7 @@ func (q *XormQuery) Scan(dest any) error {
 		// reflect 判定"单 struct 指针"以跳过 *[]T 等集合 dest：
 		// xorm 的 Get 只接受 struct 指针（二级指针/nil 直接报错）。
 		if rv := reflect.ValueOf(dest); rv.IsValid() && rv.Kind() == reflect.Ptr && rv.Type().Elem().Kind() == reflect.Struct {
+			s.NoAutoCondition(true)
 			_, err = s.Get(dest)
 			return err
 		}
@@ -155,6 +158,26 @@ func (q *XormQuery) ScanMap(dest *[]map[string]any) error {
 
 // ── Row / Rows（仅支持 Raw 原生 SQL）──────────────────────────────────
 
+// rawDialectFiltered 将 Raw() 记录的原生 SQL 按引擎方言过滤器改写后返回。
+// Row/Rows 直接走 engine.DB() 连接池执行，绕过了 xorm session 执行前的
+// dialect.Filters() 过滤（session.queryPreprocess），PG 下 '?' 占位符不会
+// 自动转成 $n，原生 SQL 直接以 '?' 参数执行会报 syntax error（真实库全覆盖
+// 发现的跨方言缺陷，fullcov_read）。此处与 xorm 同源应用同一组过滤器。
+func (q *XormQuery) rawDialectFiltered() string {
+	if q.engine == nil {
+		return q.rawSQL
+	}
+	ctx := q.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	sqlStr := q.rawSQL
+	for _, f := range q.engine.Dialect().Filters() {
+		sqlStr = f.Do(ctx, sqlStr)
+	}
+	return sqlStr
+}
+
 // errorRow 非 Raw 链上调用 Row() 的占位返回：错误延迟到 Scan 时才报出，
 // 与 *sql.Row"构造不报错、Scan 时返回错误"的语义一致，避免破坏调用方写法。
 // xorm 驱动的 Row/Rows 仅支持 Raw() 链，链式查询请改用 Take/Find。
@@ -175,7 +198,7 @@ func (q *XormQuery) Row() contracts.Row {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	return q.engine.DB().QueryRowContext(ctx, q.rawSQL, q.rawArgs...)
+	return q.engine.DB().QueryRowContext(ctx, q.rawDialectFiltered(), q.rawArgs...)
 }
 
 // Rows 执行 Raw() 记录的原生 SQL 并返回多行游标（*sql.Rows 直接满足
@@ -190,7 +213,7 @@ func (q *XormQuery) Rows() (contracts.Rows, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	rows, err := q.engine.DB().QueryContext(ctx, q.rawSQL, q.rawArgs...)
+	rows, err := q.engine.DB().QueryContext(ctx, q.rawDialectFiltered(), q.rawArgs...)
 	if err != nil {
 		return nil, q.done(err)
 	}

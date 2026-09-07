@@ -593,6 +593,70 @@ func TestXormFirstRecordNotFound(t *testing.T) {
 	}
 }
 
+// ── Exists / FirstOrCreate / FirstOrInit：dest 不作查询条件 ────────────
+//
+// xorm 的 Get/Count(bean) 会把 dest 非空字段自动并入 WHERE（MergeConds），
+// dest 预置默认值时命中判定被静默收窄（与 gorm 语义不一致）。修复：三处统一
+// NoAutoCondition（同 First/Last/Take/Scan 的 getOne 口径），查询范围只由
+// 链上 Where/conds 决定。本组测试用"dest 预置与库中不一致的值"锁定该语义——
+// 旧行为下 FirstOrCreate 会误判未命中并插入主键冲突行（ErrDuplicatedKey）。
+
+func TestXormDestNotMergedIntoConds(t *testing.T) {
+	drv := newXormTestDriverWithModel(t)
+	q := drv.Query()
+
+	if err := q.Create(&XormTestModel{ID: "f1", Name: "db-name"}); err != nil {
+		t.Fatalf("Create 失败: %v", err)
+	}
+
+	// Exists：dest 预置与库中不一致的 Name，仍应按 conds 命中
+	exists, err := q.Exists(&XormTestModel{ID: "f1", Name: "wrong"}, "id = ?", "f1")
+	if err != nil {
+		t.Fatalf("Exists 失败: %v", err)
+	}
+	if !exists {
+		t.Error("dest 非空字段不应收窄 Exists 条件，期望 true")
+	}
+
+	// FirstOrCreate：dest 预置 Name 与库中不一致 → 应命中既有行回填，而非
+	// 收窄未命中后插入（旧行为插入主键 f1 会报重复键）
+	dest := &XormTestModel{ID: "f1", Name: "preset-other"}
+	if err := q.FirstOrCreate(dest, "id = ?", "f1"); err != nil {
+		t.Fatalf("FirstOrCreate 应命中既有行: %v", err)
+	}
+	if dest.Name != "db-name" {
+		t.Errorf("命中应回填库中值 db-name, 实际 %q", dest.Name)
+	}
+	var n int64
+	if err := q.Model(&XormTestModel{}).Count(&n); err != nil {
+		t.Fatalf("Count 失败: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("命中不应新增行, 期望 1, 实际 %d", n)
+	}
+
+	// FirstOrCreate 未命中路径不受影响：dest 原值照常插入
+	miss := &XormTestModel{ID: "f2", Name: "created"}
+	if err := q.FirstOrCreate(miss, "id = ?", "f2"); err != nil {
+		t.Fatalf("FirstOrCreate(未命中) 失败: %v", err)
+	}
+	if err := q.Model(&XormTestModel{}).Count(&n); err != nil {
+		t.Fatalf("Count 失败: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("未命中应插入新行, 期望 2, 实际 %d", n)
+	}
+
+	// FirstOrInit：dest 预置不一致值 → 命中回填库中行
+	initDest := &XormTestModel{ID: "f1", Name: "preset-other"}
+	if err := q.FirstOrInit(initDest, "id = ?", "f1"); err != nil {
+		t.Fatalf("FirstOrInit 失败: %v", err)
+	}
+	if initDest.Name != "db-name" {
+		t.Errorf("FirstOrInit 命中应回填库中值 db-name, 实际 %q", initDest.Name)
+	}
+}
+
 // ── Exists ───────────────────────────────────────────────────────────
 
 func TestXormExistsScenarios(t *testing.T) {

@@ -168,8 +168,8 @@ func (q *XormQuery) save(value any) (int64, error) {
 // 插入路径与 Create 完全一致——gorm 驱动的 Save 空主键同样先落 gorm
 // BeforeCreate 生成 ID，此处复用 createCore 对齐该语义。
 // 更新路径用 AllCols() 写入所有字段（含零值），对应 gorm Save "更新全部字段"
-// 的行为。差异：gorm 更新命中 0 行会回落 upsert 插入，此处保持纯更新语义，
-// 0 行场景由调用方经 SaveResult().IsZeroRow() 自行判定。
+// 的行为。更新命中 0 行经主键存在性探测分流（见下方注释）：行不存在回落插入
+// （X-04 upsert）；行已存在仅值无变化则不插入、0 行返回。
 func (q *XormQuery) saveOne(value any) (int64, error) {
 	if pkAllZero(q.engine, value) {
 		return q.createCore(value)
@@ -194,6 +194,19 @@ func (q *XormQuery) saveOne(value any) (int64, error) {
 	// gorm Save 语义：更新命中 0 行（行不存在）回落 INSERT（X-04 upsert）。
 	// licence 菜单同步等 upsert 场景依赖该语义；行已存在时不会走到这里。
 	if n == 0 {
+		// 0 行有两类成因，须先按主键探测区分——各方言 UPDATE 受影响行数计数
+		// 不一致：PG 按命中行计数（0 行 ⇔ 行不存在）；MySQL 按已修改行计数，
+		// 行存在但 SET 值无变化时同样返回 0 affected。若直接回落 INSERT，
+		// MySQL 下"值无变化 Save"会误报主键重复（真实缺陷：真实库矩阵暴露，
+		// SaveResult 命中行全列同值 → Duplicate entry）。
+		//   1) 行不存在 → X-04 upsert：回落 INSERT 重建行；
+		//   2) 行存在仅值无变化 → 0 行即"已是最新"，跳过插入直接返回。
+		if exist, err := q.rowExistsByPK(value); err != nil {
+			return 0, q.done(err)
+		} else if exist {
+			q.invalidateCache()
+			return 0, q.done(invokeAfterUpdate(q, value))
+		}
 		return q.createCore(value)
 	}
 	q.invalidateCache()
@@ -213,6 +226,10 @@ func (q *XormQuery) Save(value any) error {
 // map 键无条件写入，保证 gorm Update"显式指定列（含零值）"的语义。
 // 不调用模型钩子，与 gorm 驱动一致。
 //
+// X-09：Model(&bean) 主键非零时，bean 主键等值条件并入会话（gorm 语义对齐）——
+// xorm 的 Update 不会从 Model bean 自动推导 WHERE，漏加会生成无 WHERE 的全表
+// UPDATE（数据破坏级，stitch-mes 事故报告 2026-09-07）。
+//
 // X-08：value 为 contracts.SQLExpression（contracts.Expr 返回值）时改走
 // updateWithExpr，生成 "SET col = <表达式>" 的数据库端原子更新。
 func (q *XormQuery) updateColumnCore(column string, value any) (int64, error) {
@@ -223,6 +240,7 @@ func (q *XormQuery) updateColumnCore(column string, value any) (int64, error) {
 	if err != nil {
 		return 0, q.done(err)
 	}
+	q.applyModelPKCond(s)
 	// n 为受影响行数，仅成功路径回填 Result；错误路径忽略（行数无意义）
 	n, err := s.Update(map[string]any{column: value})
 	if err != nil {
@@ -246,6 +264,7 @@ func (q *XormQuery) Update(column string, value any) error {
 // map 传参写入全部键。不调用模型钩子，与 gorm 驱动一致。
 // 注：struct 更新路径不支持表达式字段——xorm 的 struct 写入按列绑定字段值，
 // 无法承载 "col = col + ?" 形态的表达式，需要表达式请用 map 传参。
+// X-09：Model(&bean) 主键非零时并入主键等值条件（同 updateColumnCore）。
 func (q *XormQuery) updatesCore(values any) (int64, error) {
 	if m, ok := values.(map[string]any); ok && mapHasSQLExpr(m) {
 		return q.updateWithExpr(q.tableName, m)
@@ -254,6 +273,7 @@ func (q *XormQuery) updatesCore(values any) (int64, error) {
 	if err != nil {
 		return 0, q.done(err)
 	}
+	q.applyModelPKCond(s)
 	n, err := s.Update(values)
 	if err != nil {
 		return 0, q.done(err)
@@ -270,6 +290,77 @@ func mapHasSQLExpr(m map[string]any) bool {
 		}
 	}
 	return false
+}
+
+// ── Model 主键条件并入（X-09，Updates/Update 写路径）────────────────────
+//
+// 缺陷背景（stitch-mes 事故报告 2026-09-07）：xorm 的 Session.Update 不会从
+// Model() 记录的 bean 推导 WHERE（与 gorm 驱动/GORM v2 的 Model(&bean) 行为
+// 不同），链上无显式 Where 时生成无 WHERE 的全表 UPDATE，静默改写整表。
+//
+// 修复语义（对齐 gorm）：
+//   - Model(&bean) 且 bean 主键含非零值 → 主键等值条件并入更新（与链上
+//     Where 取 AND 交集）；
+//   - 主键全零 / 无主键 / 非 struct → 不附加条件，保持链上现状（批量更新
+//     场景经显式 Where 或 Table() 表达；全零主键 + 无 Where 的全表写行为
+//     不变，已在 contracts 文档显著标注）。
+
+// applyModelPKCond 把 Model() bean 的非零主键等值条件并入会话（session 路径）。
+func (q *XormQuery) applyModelPKCond(s *xorm.Session) {
+	if eq := q.modelPKCond(); len(eq) > 0 {
+		s.Where(eq)
+	}
+}
+
+// mergedWriteCond 返回表达式 UPDATE（builder 组装路径）的完整 WHERE：
+// 链上 condSpecs 与 Model bean 主键条件取 AND 交集。
+func (q *XormQuery) mergedWriteCond() builder.Cond {
+	cond := q.buildCond()
+	if eq := q.modelPKCond(); len(eq) > 0 {
+		if cond == nil {
+			return eq
+		}
+		return builder.And(cond, eq)
+	}
+	return cond
+}
+
+// modelPKCond 提取 Model() bean 的非零主键等值条件；无 modelValue、非 struct、
+// 无主键、解析失败或主键全零时返回 nil（不附加条件）。
+// 零值主键列跳过而非并入（对齐 gorm 对零值主键不加条件的语义），部分非零的
+// 复合主键只收敛已填充列。
+func (q *XormQuery) modelPKCond() builder.Eq {
+	if q.modelValue == nil {
+		return nil
+	}
+	bean := tableBeanOf(q.modelValue)
+	if bean == nil {
+		return nil
+	}
+	t, err := q.engine.TableInfo(bean)
+	if err != nil || len(t.PrimaryKeys) == 0 {
+		return nil
+	}
+	rv := reflect.Indirect(reflect.ValueOf(q.modelValue))
+	if rv.Kind() != reflect.Struct {
+		return nil
+	}
+	eq := builder.Eq{}
+	for _, name := range t.PrimaryKeys {
+		col := t.GetColumn(name)
+		if col == nil {
+			continue
+		}
+		// FieldIndex 定位：兼容 extends 嵌入主键（X-03 同款路径）
+		fv := structFieldValue(rv, col)
+		if fv.IsValid() && fv.CanInterface() && !fv.IsZero() {
+			eq[name] = fv.Interface()
+		}
+	}
+	if len(eq) == 0 {
+		return nil
+	}
+	return eq
 }
 
 // ── 表达式 UPDATE（X-08）─────────────────────────────────────────────
@@ -359,7 +450,8 @@ func (q *XormQuery) updateWithExpr(table string, set map[string]any) (int64, err
 		}
 	}
 	b := builder.Update(setCond).From(q.schemaTable(table))
-	if cond := q.buildCond(); cond != nil {
+	// X-09：Model bean 的非零主键并入 WHERE（与链上条件 AND），对齐普通路径。
+	if cond := q.mergedWriteCond(); cond != nil {
 		b = b.Where(cond)
 	}
 	sqlStr, args, err := builder.ToSQL(b)
@@ -535,31 +627,79 @@ func structFieldValue(rv reflect.Value, col *schemas.Column) reflect.Value {
 
 // ── 主键条件构造（Save 更新路径用）─────────────────────────────────────
 
-// applyPKCondition 按主键列的当前值构造 WHERE 等值条件。
+// applyPKCondition 按主键列的当前值构造 WHERE 等值条件并写入会话。
+func applyPKCondition(s *xorm.Session, e *xorm.Engine, value any) error {
+	eq, err := pkEqOf(e, value)
+	if err != nil {
+		return err
+	}
+	s.Where(eq)
+	return nil
+}
+
+// pkEqOf 提取 value 的主键列等值条件（Save 更新路径与 0 行存在性探测共用）。
 // xorm Session.Update 的 WHERE 仅来自显式条件，不会自动附加被更新 bean 的
 // 主键（与 gorm 行为不同），漏加会生成无 WHERE 的全表 UPDATE。
-func applyPKCondition(s *xorm.Session, e *xorm.Engine, value any) error {
+// 列名取 xorm 映射后的库列名（t.PrimaryKeys）；字段定位用 FieldIndex，
+// 兼容 extends 嵌入主键（X-03）；主键列无法定位时报错而非静默放行。
+func pkEqOf(e *xorm.Engine, value any) (builder.Eq, error) {
 	t, err := e.TableInfo(tableBeanOf(value))
 	if err != nil {
-		return fmt.Errorf("xorm: Save 解析表信息失败: %w", err)
+		return nil, fmt.Errorf("xorm: Save 解析表信息失败: %w", err)
 	}
 	rv := reflect.Indirect(reflect.ValueOf(value))
 	if rv.Kind() != reflect.Struct {
-		return fmt.Errorf("%w: Save 更新路径要求 struct，收到 %T", contracts.ErrUnsupported, value)
+		return nil, fmt.Errorf("%w: Save 更新路径要求 struct，收到 %T", contracts.ErrUnsupported, value)
 	}
 	eq := builder.Eq{}
 	for _, col := range t.PrimaryKeys {
 		c := t.GetColumn(col)
 		if c == nil {
-			return fmt.Errorf("xorm: 主键列 %q 无法定位", col)
+			return nil, fmt.Errorf("xorm: 主键列 %q 无法定位", col)
 		}
 		// FieldIndex 定位：兼容 extends 嵌入（FieldName 带前缀，见 X-03）
 		fv := structFieldValue(rv, c)
 		if !fv.IsValid() {
-			return fmt.Errorf("xorm: 主键列 %q 对应字段 %q 不存在", col, c.FieldName)
+			return nil, fmt.Errorf("xorm: 主键列 %q 对应字段 %q 不存在", col, c.FieldName)
 		}
 		eq[col] = fv.Interface()
 	}
+	return eq, nil
+}
+
+// rowExistsByPK 按主键等值条件探测行是否存在（saveOne 0 行回落判定用）。
+// 探测条件仅主键等值、不含链上 Where（行存在性与链上条件无关）；表名取链上
+// Table/Model 记录或 value 推导，schema 前缀经 schemaTable 解析，与更新路径
+// 落到同一张表。事务内复用事务会话（q.tx），保证读到同一事务视图，避免跨
+// 连接探测与事务内未提交变更错位；事务外新建独立会话执行。
+func (q *XormQuery) rowExistsByPK(value any) (bool, error) {
+	eq, err := pkEqOf(q.engine, value)
+	if err != nil {
+		return false, err
+	}
+	if len(eq) == 0 {
+		return false, nil
+	}
+	var s *xorm.Session
+	if q.tx != nil {
+		s = q.tx
+	} else {
+		s = q.engine.NewSession()
+		defer s.Close()
+	}
+	if q.ctx != nil {
+		s = s.Context(q.ctx)
+	}
+	name := q.tableName
+	if name == "" {
+		if n, err := tableInfoName(q.engine, value); err == nil {
+			name = n
+		}
+	}
 	s.Where(eq)
-	return nil
+	if name != "" {
+		s.Table(q.schemaTable(name))
+		return s.Exist()
+	}
+	return s.Exist(tableBeanOf(value))
 }

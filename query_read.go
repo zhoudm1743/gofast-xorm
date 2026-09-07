@@ -55,6 +55,12 @@ const (
 // （xorm Limit 不重置已设置的 Start），与 gorm First/Last/Take 的单行语义一致。
 // 未命中行统一构造 sql.ErrNoRows 交给 q.done → wrapError 映射为
 // contracts.ErrRecordNotFound；仅在真实取到行后触发 AfterFind 钩子。
+//
+// 查询范围只由链上 Where/conds 决定：Get 前置 NoAutoCondition，禁止 xorm 把
+// dest 的非空字段自动并入 WHERE（MergeConds）。dest 是纯输出容器（gorm 语义），
+// 复用已填充的 dest 再次 First/Last/Take 不得静默收窄条件导致误报未命中或
+// 错行——真实库全覆盖发现的读路径缺陷（fullcov_read）。软删除列过滤不受影响：
+// MergeConds 的 NoAutoCondition 分支仍按 deleted tag 追加 CondDeleted。
 func (q *XormQuery) getOne(dest any, conds []any, order pkSort) error {
 	s, err := q.build(dest)
 	if err == nil {
@@ -71,7 +77,7 @@ func (q *XormQuery) getOne(dest any, conds []any, order pkSort) error {
 		}
 	}
 	if err == nil {
-		s.Limit(1)
+		s.Limit(1).NoAutoCondition(true)
 		var found bool
 		found, err = s.Get(dest)
 		if err == nil && !found {
@@ -123,6 +129,9 @@ func (q *XormQuery) Count(count *int64) error {
 
 // Exists 判断是否存在命中行：LIMIT 1 让 DB 命中首行后即可短路，避免全量计数。
 // 只关心布尔结果且无可序列化的行数据，不走查询缓存。
+// 与 First/Last/Take/Scan 同一口径（getOne）：NoAutoCondition 禁止 xorm 把
+// dest 的非空字段自动并入 WHERE（MergeConds）——dest 仅是表定位与输出容器，
+// 查询范围只由链上 Where/conds 决定。
 func (q *XormQuery) Exists(dest any, conds ...any) (bool, error) {
 	s, err := q.build(dest)
 	if err == nil {
@@ -132,7 +141,7 @@ func (q *XormQuery) Exists(dest any, conds ...any) (bool, error) {
 		return false, q.done(err)
 	}
 	s.Limit(1)
-	n, err := s.Count(dest)
+	n, err := s.NoAutoCondition(true).Count(dest)
 	return n > 0, q.done(err)
 }
 
@@ -210,6 +219,9 @@ func (q *XormQuery) FindInBatches(dest any, batchSize int, fc func(contracts.Que
 // FirstOrCreate 按条件查询，命中返回该行；未命中将 dest 插入数据库。
 // 主键自动生成由 invokeBeforeCreate 触发（AutoGenerateID），写后失效查询缓存，
 // 与 Create 语义一致。
+// 查询范围只由链上 Where/conds 决定（NoAutoCondition）：dest 预置的默认值
+// 仅用于未命中时的插入，不作为查询条件（gorm 同款语义——gorm 也不会把 dest
+// 非零字段并入 FirstOrCreate 的查询条件）。
 func (q *XormQuery) FirstOrCreate(dest any, conds ...any) error {
 	s, err := q.build(dest)
 	if err != nil {
@@ -218,7 +230,7 @@ func (q *XormQuery) FirstOrCreate(dest any, conds ...any) error {
 	if err := applyConds(s, conds); err != nil {
 		return q.done(err)
 	}
-	found, err := s.Get(dest)
+	found, err := s.NoAutoCondition(true).Get(dest)
 	if err != nil {
 		return q.done(err)
 	}
@@ -243,6 +255,7 @@ func (q *XormQuery) FirstOrCreate(dest any, conds ...any) error {
 
 // FirstOrInit 按条件查询，命中填充 dest 并触发 AfterFind 钩子；未命中 dest 保持
 // 调用方传入的原值、不落库。
+// 查询范围只由链上 Where/conds 决定（NoAutoCondition，同 FirstOrCreate）。
 // 与 gorm 的差异：gorm 会把 struct/map 条件的属性回填进 dest，此处不做回填，
 // 需要默认值时由调用方在 dest 中预置。
 func (q *XormQuery) FirstOrInit(dest any, conds ...any) error {
@@ -253,7 +266,7 @@ func (q *XormQuery) FirstOrInit(dest any, conds ...any) error {
 	if err := applyConds(s, conds); err != nil {
 		return q.done(err)
 	}
-	found, err := s.Get(dest)
+	found, err := s.NoAutoCondition(true).Get(dest)
 	if err != nil {
 		return q.done(err)
 	}

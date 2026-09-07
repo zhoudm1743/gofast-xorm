@@ -22,6 +22,9 @@
 //     驱动侧仅保留 MetaAdapter/子查询构造薄包装；关联解析覆盖 rel tag → gorm
 //     tag → 约定 → 方向判定 → many2many → polymorphic 全链（query_preload.go）。
 //     Debug()/Lock(LockShareMode)：xorm 无对应能力，文档化 no-op。
+//   - Model(&bean).Updates/Update（X-09）：bean 主键非零时自动并入主键等值
+//     条件（与 gorm 驱动一致）；主键全零/无主键不附加条件，链上无 Where 即
+//     为全表更新（批量写请显式 Where）。
 package xormdriver
 
 import (

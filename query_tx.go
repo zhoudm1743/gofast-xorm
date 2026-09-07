@@ -2,7 +2,6 @@ package xormdriver
 
 import (
 	"fmt"
-	"strconv"
 
 	"github.com/zhoudm1743/go-fast-framework/contracts"
 )
@@ -73,16 +72,24 @@ func (q *XormQuery) Rollback() error {
 	return q.done(err)
 }
 
-// SavePoint 在当前事务内创建保存点。名字用双引号引用：SQLite/PostgreSQL
-// 对双引号标识符合法；MySQL 默认视双引号为字符串字面量，需开启 ANSI_QUOTES
-// （或传入纯标识符）。与 gormdriver 交由 gorm 方言生成 SAVEPOINT 语句的行为
-// 存在差异，此处为显式拼接。
+// savepointIdent 为保存点名生成方言正确的标识符引用：SAVEPOINT/ROLLBACK TO 的
+// 对象是数据库标识符而非字符串字面量。MySQL 默认 SQL 模式（无 ANSI_QUOTES）
+// 视双引号为字符串字面量，"SAVEPOINT \"sp1\"" 直接语法错误 1064，必须改用
+// 反引号；PostgreSQL/SQLite 等方言双引号才合法。统一经引擎方言 Quoter 生成
+// （mysql → `sp1`、postgres → "sp1"、sqlite → `sp1`、mssql → [sp1]），
+// 避免逐方言手写拼接或依赖会话 SQL 模式。
+func (q *XormQuery) savepointIdent(name string) string {
+	return q.engine.Dialect().Quoter().Quote(name)
+}
+
+// SavePoint 在当前事务内创建保存点。名字按方言引号引用（见 savepointIdent）。
+// 与 gormdriver 交由 gorm 方言生成 SAVEPOINT 语句的行为存在差异，此处为显式拼接。
 func (q *XormQuery) SavePoint(name string) error {
 	s, err := q.build(nil)
 	if err != nil {
 		return q.done(err)
 	}
-	if _, err := s.Exec("SAVEPOINT " + strconv.Quote(name)); err != nil {
+	if _, err := s.Exec("SAVEPOINT " + q.savepointIdent(name)); err != nil {
 		return q.done(err)
 	}
 	return nil
@@ -94,7 +101,7 @@ func (q *XormQuery) RollbackTo(name string) error {
 	if err != nil {
 		return q.done(err)
 	}
-	if _, err := s.Exec("ROLLBACK TO " + strconv.Quote(name)); err != nil {
+	if _, err := s.Exec("ROLLBACK TO " + q.savepointIdent(name)); err != nil {
 		return q.done(err)
 	}
 	return nil

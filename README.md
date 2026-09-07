@@ -35,6 +35,22 @@ database:
       # ...
 ```
 
+## 语义说明
+
+- `Model(&bean).Updates(...)` / `Update(col, val)`：bean 主键含非零值时，
+  主键等值条件自动并入更新（与链上 `Where` 取 AND 交集），与 gorm 驱动 /
+  GORM v2 行为一致。主键全零或无主键时不附加条件，更新范围完全由链上
+  `Where` 决定——**无 `Where` 即为全表更新**，批量写请务必显式 `Where`
+  或使用 `Table()` 并确认影响范围。
+- `Save(value)`：主键全零插入；非零按主键更新（行不存在回落插入）。
+  注：MySQL 按"已修改行"计数 affected rows——行存在但写入值无变化时
+  `SaveResult.RowsAffected` 为 0（不报错、不误插；gorm 驱动在 MySQL 上
+  同为 0，PG 上两驱动均按命中行计 1），需要区分"未命中"时请结合主键
+  存在性判断而非只看行数。
+- `Exists` / `FirstOrCreate` / `FirstOrInit` 与 `First`/`Last`/`Take`/`Scan`
+  口径一致：dest 的非零字段**不会**并入查询条件，查询范围只由链上
+  `Where`/conds 决定；`FirstOrCreate` 未命中时按 dest 原值插入。
+
 ## 依赖
 
 - `github.com/zhoudm1743/go-fast-framework` >= v0.8.2

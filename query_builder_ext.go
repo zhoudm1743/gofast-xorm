@@ -195,10 +195,13 @@ func (q *XormQuery) Unscoped() contracts.Query {
 // OnlyTrashed 仅查询已软删除的记录（deleted_at != 0）。
 // 列名 "deleted_at" 与 database.SoftDelete.DeletedAt 字段绑定，
 // 若自定义软删除列名需自行实现此逻辑。
-// 与 gormdriver 的 Unscoped().Where(...) 不同，这里无需叠加 Unscoped：
-// 业务级 deleted_at 列并非 xorm `deleted` tag，不会被 xorm 自动过滤。
+// 执行期先 s.Unscoped() 再挂条件：模型带 xorm `deleted` tag 时 xorm 会在查询
+// 自动追加 "deleted_at = 0" 未删过滤，不与 Unscoped 取消会与 "deleted_at != 0"
+// 取 AND 交集后恒空（分组 5 集成测试暴露）；无 tag 的业务级 deleted_at 列本
+// 就不被 xorm 过滤，Unscoped 置位无副作用，两形态语义统一。
 func (q *XormQuery) OnlyTrashed() contracts.Query {
 	return q.addApplier("onlytrashed", func(q *XormQuery, s *xorm.Session) error {
+		s.Unscoped()
 		return applyCondToSession(s, condWhere, "deleted_at != 0", nil)
 	})
 }
@@ -219,8 +222,10 @@ func (q *XormQuery) Restore() error {
 	return nil
 }
 
-// ForceDelete 物理删除记录（xorm Delete 默认即物理删除，等价
-// gorm Unscoped().Delete 语义），conds 复用终结方法变参条件。
+// ForceDelete 物理删除记录（等价 gorm Unscoped().Delete 语义），conds 复用
+// 终结方法变参条件。执行期先 s.Unscoped() 再 Delete：xorm 对带 `deleted` tag
+// 的模型默认把 Delete 改写为 "UPDATE deleted_at = 值" 的软删除，不取消该语义
+// 时"物理删除"实为软删（分组 5 集成测试暴露）；无 tag 模型上 Unscoped 无副作用。
 // 与 gormdriver 一致不触发 Before/AfterDelete 钩子——钩子面向业务级软删除
 // 的 Delete 路径。写终结成功后失效查询缓存。
 func (q *XormQuery) ForceDelete(value any, conds ...any) error {
@@ -231,6 +236,7 @@ func (q *XormQuery) ForceDelete(value any, conds ...any) error {
 	if err := applyConds(s, conds); err != nil {
 		return q.done(err)
 	}
+	s.Unscoped()
 	if _, err := s.Delete(value); err != nil {
 		return q.done(err)
 	}
