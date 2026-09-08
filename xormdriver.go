@@ -43,12 +43,13 @@ import (
 
 // XormDriver 实现 contracts.Driver（方法见 driver.go / cacher.go）。
 type XormDriver struct {
-	engine        *xorm.Engine
-	schema        string        // 连接级默认 schema（cfg.Schema）
-	tablePrefix   string        // 表名前缀（cfg.TablePrefix）
-	tagIdentifier string        // 引擎读取的 struct tag 键名（cfg.TagIdentifier，空值归一为 "xorm"）
-	qc            *queryCache   // 查询缓存；EnableCaches 后非 nil（见 cacher.go）
-	log           contracts.Log // 框架日志器（AutoMigrate 启动期校验告警用；构造时 nil 已降级 discardLog）
+	engine         *xorm.Engine
+	schema         string        // 连接级默认 schema（cfg.Schema）
+	tablePrefix    string        // 表名前缀（cfg.TablePrefix）
+	tagIdentifier  string        // 引擎读取的 struct tag 键名（cfg.TagIdentifier，空值归一为 "xorm"）
+	qc             *queryCache   // 查询缓存；EnableCaches 后非 nil（见 cacher.go）
+	rebuildIndexes bool          // WithRebuildIndexes：Sync2 前 drop 同名异构索引（migrate.go）
+	log            contracts.Log // 框架日志器（AutoMigrate 启动期校验告警用；构造时 nil 已降级 discardLog）
 }
 
 // ── 查询构建器 ───────────────────────────────────────────────────────

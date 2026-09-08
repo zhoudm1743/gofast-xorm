@@ -24,10 +24,28 @@ var _ contracts.Driver = (*XormDriver)(nil)
 //	postgres → "pgx"（jackc/pgx/v5 stdlib）
 //	sqlite   → "sqlite"（glebarez/go-sqlite，纯 Go）
 //	mssql    → "mssql"（microsoft/go-mssqldb）
-func NewXormDriver(cfg contracts.ConnectionConfig, log contracts.Log) (*XormDriver, error) {
+//
+// opts 为可选功能行为（迁移安全模式 / 索引收敛，见 migrate.go）；不传保持原行为。
+// 自建短生命周期驱动执行 AutoMigrate 是受支持用法（schema-per-tenant 批量迁移），
+// 迁移场景推荐 NewMigrateDriver / Migrate（migrate-safe 模式）。
+func NewXormDriver(cfg contracts.ConnectionConfig, log contracts.Log, opts ...DriverOption) (*XormDriver, error) {
 	cfg.ApplyDefaults()
 
+	var options driverOptions
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&options)
+		}
+	}
+
 	dsn := cfg.BuildDSN()
+	if options.migrateSafe {
+		if cfg.Engine == "postgres" {
+			dsn = migrateSafeDSN(dsn)
+		} else if log != nil {
+			log.Info("[GoFast] xormdriver driver: WithMigrateSafe 仅支持 postgres，已忽略")
+		}
+	}
 
 	var engine *xorm.Engine
 	var err error
@@ -129,7 +147,7 @@ func NewXormDriver(cfg contracts.ConnectionConfig, log contracts.Log) (*XormDriv
 		return nil, fmt.Errorf("[GoFast] xormdriver driver: database ping failed: %w: %w", err, contracts.ErrConnFailed)
 	}
 
-	return &XormDriver{engine: engine, schema: cfg.Schema, tablePrefix: cfg.TablePrefix, tagIdentifier: tagIdentifier, log: log}, nil
+	return &XormDriver{engine: engine, schema: cfg.Schema, tablePrefix: cfg.TablePrefix, tagIdentifier: tagIdentifier, rebuildIndexes: options.rebuildIndexes, log: log}, nil
 }
 
 // Query 创建新的查询构建器实例；可传入 context 用于超时/取消与链路追踪。
@@ -160,20 +178,21 @@ func (d *XormDriver) Close() error { return d.engine.Close() }
 // 不支持项与 identifier 陷阱只告警不中断。
 // PostgreSQL 多租户：在事务内显式 SET LOCAL search_path，确保 DDL 在正确的 schema
 // 执行，不依赖连接池的 DSN 初始化值（xorm 事务签名为 func(*Session) (any, error)）。
+// 列收敛：Sync2 按基类型判等不改已有列类型/长度/nullable，AutoMigrate 在 Sync2
+// 后追加收敛 Pass（migrate_converge.go，与 Sync2 同事务）。
+// rebuildIndexes（WithRebuildIndexes，PG/MySQL/MSSQL）：Sync2 前在事务外
+// drop 同名异构索引——不能放在事务内：Sync2 内部经 pg_indexes 读取索引定义，
+// 会被本事务未提交的 DROP INDEX 锁阻塞（实测确认，IO wait 死等）。
 func (d *XormDriver) AutoMigrate(models ...any) error {
 	if err := d.validateOrmTags(models); err != nil {
 		return err
 	}
-	if d.schema == "" {
-		return d.engine.Sync2(models...)
-	}
-	_, err := d.engine.Transaction(func(s *xorm.Session) (any, error) {
-		if _, err := s.Exec(fmt.Sprintf(`SET LOCAL search_path TO "%s"`, d.schema)); err != nil {
-			return nil, fmt.Errorf("set search_path failed: %w", err)
+	if d.rebuildIndexes {
+		if err := d.dropMismatchedIndexes(models); err != nil {
+			return err
 		}
-		return nil, s.Sync2(models...)
-	})
-	return err
+	}
+	return d.sync2(models...)
 }
 
 // RawEngine 逃生口：允许高级用户直接获取 *xorm.Engine，使用 xorm 原生 API

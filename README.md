@@ -60,6 +60,17 @@ database:
 
 双驱动联合测试方案与执行报告：`../docs/md/dual-driver-test-plan.md`。
 
+## 原生迁移能力
+
+- **迁移安全模式**：`WithMigrateSafe()` / `NewMigrateDriver` / `Migrate(cfg, models...)`，
+  PG 下强制 `default_query_exec_mode=exec`，根治 ALTER COLUMN TYPE 后的 pgx 语句
+  缓存 0A000（stitch-mes 历史 BUG 同款机制）。
+- **Dry-run 预览**：`MigrateSQL(cfg, models...)`——postgres/mssql 事务回滚、
+  mysql 临时库克隆，返回待执行 DDL 列表且目标库零变化。
+- **索引收敛**：`CheckIndexes` 体检 + `WithRebuildIndexes` 重建同名异构索引。
+- 完整映射对照表、schema-per-tenant 批量迁移姿势、双驱动 AutoMigrate 语义差异：
+  [docs/migration.md](docs/migration.md)。
+
 ## 依赖
 
 - `github.com/zhoudm1743/go-fast-framework` >= v0.8.2
