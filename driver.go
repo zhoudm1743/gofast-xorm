@@ -52,12 +52,12 @@ func NewXormDriver(cfg contracts.ConnectionConfig, log contracts.Log, opts ...Dr
 
 	switch cfg.Engine {
 	case "mysql":
-		engine, err = xorm.NewEngine("mysql", dsn)
+		engine, err = newConfiguredEngine(cfg, "mysql", dsn)
 	case "postgres":
 		// pgx stdlib 的 stdlib.OpenDB 兼容 keyword=value 形式的 DSN，
 		// BuildDSN 生成的 "host=... search_path=..." 关键字串可直接使用
 		// （未知关键字作为运行时参数下发服务端）。
-		engine, err = xorm.NewEngine("pgx", dsn)
+		engine, err = newConfiguredEngine(cfg, "pgx", dsn)
 	case "sqlite", "sqlite3":
 		// glebarez/go-sqlite 不识别 BuildDSN 生成中的 mattn 风格参数
 		// （_journal_mode/_busy_timeout 等为 mattn/go-sqlite3 专属），
@@ -74,46 +74,15 @@ func NewXormDriver(cfg contracts.ConnectionConfig, log contracts.Log, opts ...Dr
 				return nil, fmt.Errorf("[GoFast] xormdriver driver: cannot create dir %q: %w", dir, mkErr)
 			}
 		}
-		engine, err = xorm.NewEngine("sqlite", dbPath)
+		engine, err = newConfiguredEngine(cfg, "sqlite", dbPath)
 	case "mssql":
-		engine, err = xorm.NewEngine("mssql", dsn)
+		engine, err = newConfiguredEngine(cfg, "mssql", dsn)
 	default:
 		return nil, fmt.Errorf("[GoFast] xormdriver driver: unsupported engine %q", cfg.Engine)
 	}
 
 	if err != nil {
 		return nil, fmt.Errorf("[GoFast] xormdriver driver: connection failed: %w", err)
-	}
-
-	// 配置表名前缀映射（仅表名，列名保持 SnakeMapper）。
-	// schema 前缀不并入 mapper：由查询层按 dest 推导后拼接（见 xormdriver.go 的
-	// schemaTable/build），显式 Table() 永远优先，与 gormdriver NamingStrategy 语义对齐。
-	if cfg.TablePrefix != "" {
-		engine.SetTableMapper(names.NewPrefixMapper(names.SnakeMapper{}, cfg.TablePrefix))
-	}
-	// PostgreSQL 多租户（U18 集成回归发现）：xorm postgres 方言的 DDL（Sync2
-	// 建表/改列/索引）以 URI().Schema 限定表名，缺省回退 "public"——事务内
-	// SET LOCAL search_path 改变不了它的落点。将连接配置的 Schema 同步给引擎，
-	// 保证 AutoMigrate 在正确 schema 建表；DML 侧 schemaTable 已拼前缀的表名
-	// 含 "."，xorm 不会重复追加。
-	if cfg.Schema != "" && cfg.Engine == "postgres" {
-		engine.SetSchema(cfg.Schema)
-	}
-	// 列名映射（X-02）：默认 GonicMapper（xorm 原生，常用缩写不加下划线，
-	// DeptID→dept_id、ID→id，与 GORM NamingStrategy 同一套缩写规则），保证
-	// 同一模型在 gorm/xorm 两驱动下列名一致；表名仍为 SnakeMapper 单数。
-	// naming: "snake" 回退 SnakeMapper 逐字下划线行为（DeptID→dept_i_d）。
-	if cfg.Naming != "snake" {
-		engine.SetColumnMapper(names.GonicMapper{})
-	}
-
-	// 统一模型标签接入（orm-tag-design.md §8.2）：tag_identifier 配置切换引擎
-	// 读取的 struct tag 键名（官方公开 API，引擎级全局生效）。默认 "xorm" 保持
-	// 现状；置 "orm" 后该连接所有模型的 orm tag 由 xorm 原生解析（建表/CRUD/
-	// created/updated/extends/忽略全部原生行为），xorm:"..." tag 同连接失效。
-	// 注意必须在首次 TableInfo/Sync2 之前设置（tagParser 决定列元数据推导）。
-	if cfg.TagIdentifier != "" && cfg.TagIdentifier != "xorm" {
-		engine.SetTagIdentifier(cfg.TagIdentifier)
 	}
 	// 有效 identifier（空配置归一为 "xorm"）：AutoMigrate 启动期校验（§10.3 陷阱
 	// 告警）与 Preload 忽略标记判定均按它走。
@@ -148,6 +117,55 @@ func NewXormDriver(cfg contracts.ConnectionConfig, log contracts.Log, opts ...Dr
 	}
 
 	return &XormDriver{engine: engine, schema: cfg.Schema, tablePrefix: cfg.TablePrefix, tagIdentifier: tagIdentifier, rebuildIndexes: options.rebuildIndexes, log: log}, nil
+}
+
+// newConfiguredEngine 建 xorm 引擎并应用与 NewXormDriver 完全一致的命名/标签/
+// schema 语义。NewXormDriver 与迁移观测路径（migrateSQLTx / 临时库克隆预览引擎）
+// 共用——BUG-1（stitch-mes 实测反馈）：capture 引擎曾漏 SetColumnMapper，列名回退
+// SnakeMapper（user_id→user_i_d），对已有表加列直接 42P16 崩。
+// driverName/dsn 由调用方按用途给出（原生驱动名或 capture 驱动名）。
+func newConfiguredEngine(cfg contracts.ConnectionConfig, driverName, dsn string) (*xorm.Engine, error) {
+	engine, err := xorm.NewEngine(driverName, dsn)
+	if err != nil {
+		return nil, err
+	}
+	applyEngineNaming(cfg, engine)
+	return engine, nil
+}
+
+// applyEngineNaming 应用表名前缀 / schema / 列名 mapper / tag identifier。
+// 必须与 NewXormDriver 保持同步（单一代码路径，禁止各自维护）。
+func applyEngineNaming(cfg contracts.ConnectionConfig, engine *xorm.Engine) {
+	// 配置表名前缀映射（仅表名，列名保持 SnakeMapper）。
+	// schema 前缀不并入 mapper：由查询层按 dest 推导后拼接（见 xormdriver.go 的
+	// schemaTable/build），显式 Table() 永远优先，与 gormdriver NamingStrategy 语义对齐。
+	if cfg.TablePrefix != "" {
+		engine.SetTableMapper(names.NewPrefixMapper(names.SnakeMapper{}, cfg.TablePrefix))
+	}
+	// PostgreSQL 多租户（U18 集成回归发现）：xorm postgres 方言的 DDL（Sync2
+	// 建表/改列/索引）以 URI().Schema 限定表名，缺省回退 "public"——事务内
+	// SET LOCAL search_path 改变不了它的落点。将连接配置的 Schema 同步给引擎，
+	// 保证 AutoMigrate 在正确 schema 建表；DML 侧 schemaTable 已拼前缀的表名
+	// 含 "."，xorm 不会重复追加。
+	if cfg.Schema != "" && cfg.Engine == "postgres" {
+		engine.SetSchema(cfg.Schema)
+	}
+	// 列名映射（X-02）：默认 GonicMapper（xorm 原生，常用缩写不加下划线，
+	// DeptID→dept_id、ID→id，与 GORM NamingStrategy 同一套缩写规则），保证
+	// 同一模型在 gorm/xorm 两驱动下列名一致；表名仍为 SnakeMapper 单数。
+	// naming: "snake" 回退 SnakeMapper 逐字下划线行为（DeptID→dept_i_d）。
+	if cfg.Naming != "snake" {
+		engine.SetColumnMapper(names.GonicMapper{})
+	}
+
+	// 统一模型标签接入（orm-tag-design.md §8.2）：tag_identifier 配置切换引擎
+	// 读取的 struct tag 键名（官方公开 API，引擎级全局生效）。默认 "xorm" 保持
+	// 现状；置 "orm" 后该连接所有模型的 orm tag 由 xorm 原生解析（建表/CRUD/
+	// created/updated/extends/忽略全部原生行为），xorm:"..." tag 同连接失效。
+	// 注意必须在首次 TableInfo/Sync2 之前设置（tagParser 决定列元数据推导）。
+	if cfg.TagIdentifier != "" && cfg.TagIdentifier != "xorm" {
+		engine.SetTagIdentifier(cfg.TagIdentifier)
+	}
 }
 
 // Query 创建新的查询构建器实例；可传入 context 用于超时/取消与链路追踪。
@@ -187,12 +205,48 @@ func (d *XormDriver) AutoMigrate(models ...any) error {
 	if err := d.validateOrmTags(models); err != nil {
 		return err
 	}
+	// BUG-2（Sync2 内部变体）：Sync2 的索引 drop 循环对唯一约束（gorm unique
+	// 建成，pg_constraint 支撑索引）发 DROP INDEX 报 2BP01 中断整个迁移，且
+	// oriTable.Indexes 为 map、迭代随机，同列重复索引场景踩中与否不确定。
+	// 默认前置按 planUniqueConstraints 的确定性计划预删（仅 pgx 生效，事务外
+	// 自动提交），使 Sync2 得以按模型继续收敛重建。
+	if err := d.preDropUniqueConstraints(models); err != nil {
+		return err
+	}
 	if d.rebuildIndexes {
 		if err := d.dropMismatchedIndexes(models); err != nil {
 			return err
 		}
 	}
 	return d.sync2(models...)
+}
+
+// preDropUniqueConstraints AutoMigrate 默认前置（BUG-2）：执行
+// planUniqueConstraints 的唯一约束预删计划（事务外自动提交，记 Info 日志）。
+// 仅 pgx 有约束/索引异构问题（mysql 的 unique 即索引、DROP INDEX 无碍；
+// mssql 约束即索引、DROP INDEX 可用），其余引擎计划为空。
+func (d *XormDriver) preDropUniqueConstraints(models []any) error {
+	plans, err := planUniqueConstraints(d.engine, d.engine.DriverName(), d.schema, models)
+	if err != nil {
+		return err
+	}
+	for _, p := range plans {
+		for _, name := range p.drops {
+			var stmt string
+			if d.schema != "" {
+				stmt = fmt.Sprintf(`ALTER TABLE "%s"."%s" DROP CONSTRAINT IF EXISTS "%s"`, d.schema, p.table, name)
+			} else {
+				stmt = fmt.Sprintf(`ALTER TABLE "%s" DROP CONSTRAINT IF EXISTS "%s"`, p.table, name)
+			}
+			if d.log != nil {
+				d.log.Info(fmt.Sprintf("[GoFast] xormdriver driver: 唯一约束收敛：%s（%s.%s）", stmt, p.table, name))
+			}
+			if _, err := d.engine.Exec(stmt); err != nil {
+				return fmt.Errorf("xormdriver: drop 唯一约束 %s 失败: %w", name, err)
+			}
+		}
+	}
+	return nil
 }
 
 // RawEngine 逃生口：允许高级用户直接获取 *xorm.Engine，使用 xorm 原生 API

@@ -112,10 +112,21 @@ func Migrate(cfg contracts.ConnectionConfig, models ...any) error {
 // schema 非空时包一层事务 + SET LOCAL search_path（与 xorm postgres 方言 DDL
 // 以 URI().Schema 限定落点的机制配合）。
 //
+// 列注释中性化（BUG-3）：Sync2 前把已存在表的 TableInfo 列注释改写为库内实际值
+// （消除 Sync2 comment 分支的假阳性 ALTER / 注释清空），Sync2 后恢复模型原注释，
+// 由收敛 Pass 生成仅新增/更新的 COMMENT 语句。见 migrate_comment.go。
+//
 // 注意（实测确认）：schema 模式下 Sync2 在事务内运行，其内部元数据加载
 // （loadTableInfo）会从连接池取第二条连接——迁移驱动连接池必须 ≥2，
 // 单连接池会死锁（生产配置默认 100 无此问题，仅短生命周期自建驱动需留意）。
 func (d *XormDriver) sync2(models ...any) error {
+	engineName := d.engine.DriverName()
+	restore, err := neutralizeComments(d.engine, engineName, d.schema, models)
+	if err != nil {
+		return err
+	}
+	defer restore() // 幂等：Sync2 成功路径已显式恢复，失败路径兜底
+
 	run := func(s *xorm.Session) error {
 		if d.schema != "" {
 			if _, err := s.Exec(fmt.Sprintf(`SET LOCAL search_path TO "%s"`, d.schema)); err != nil {
@@ -125,17 +136,19 @@ func (d *XormDriver) sync2(models ...any) error {
 		if err := s.Sync2(models...); err != nil {
 			return err
 		}
+		restore() // 恢复模型原注释，供收敛 Pass 计算真实注释差异
 		return d.execConverge(s, models)
 	}
 	if d.schema == "" {
 		if err := d.engine.Sync2(models...); err != nil {
 			return err
 		}
+		restore()
 		sess := d.engine.NewSession()
 		defer sess.Close()
 		return d.execConverge(sess, models)
 	}
-	_, err := d.engine.Transaction(func(s *xorm.Session) (any, error) {
+	_, err = d.engine.Transaction(func(s *xorm.Session) (any, error) {
 		return nil, run(s)
 	})
 	return err

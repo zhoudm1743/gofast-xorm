@@ -47,7 +47,9 @@ func newXormOrmMySQL(t *testing.T) *XormDriver {
 	return drv
 }
 
-// intgXMySQLColumn 读 information_schema 单列元数据（MySQL 驱动返回大写键）。
+// intgXMySQLColumn 读 information_schema 单列元数据（返回键归一为大写：
+// 不同 MySQL 版本/驱动对 SELECT 表达式列名的大小写返回不一致，如
+// column_type vs COLUMN_TYPE）。
 func intgXMySQLColumn(t *testing.T, drv *XormDriver, table, column string) map[string]any {
 	t.Helper()
 	var rows []map[string]any
@@ -59,7 +61,11 @@ func intgXMySQLColumn(t *testing.T, drv *XormDriver, table, column string) map[s
 	if err != nil || len(rows) != 1 {
 		t.Fatalf("读取列 %s.%s 元数据失败 rows=%d err=%v", table, column, len(rows), err)
 	}
-	return rows[0]
+	norm := make(map[string]any, len(rows[0]))
+	for k, v := range rows[0] {
+		norm[strings.ToUpper(k)] = v
+	}
+	return norm
 }
 
 // TestXormOrmMySQL_DDLFullMatrix（§11.15/§11.18）xorm identifier=orm 全维度 DDL
@@ -88,8 +94,9 @@ func TestXormOrmMySQL_DDLFullMatrix(t *testing.T) {
 		t.Errorf("amount notnull 应 NOT NULL, 实际 %v", amount["IS_NULLABLE"])
 	}
 
-	// bigint / bool（MySQL bool 即 tinyint(1)）
-	if big := intgXMySQLColumn(t, drv, "intg_xddl_models", "big_num"); big["COLUMN_TYPE"] != "bigint" {
+	// bigint / bool（MySQL bool 即 tinyint(1)；5.7 的 bigint 带显示宽度 bigint(20)，
+	// 8.0.17+ 起为 bigint——按前缀断言兼容两版本）
+	if big := intgXMySQLColumn(t, drv, "intg_xddl_models", "big_num"); !strings.HasPrefix(fmt.Sprint(big["COLUMN_TYPE"]), "bigint") {
 		t.Errorf("bigint 应映射 bigint, 实际 %v", big["COLUMN_TYPE"])
 	}
 	if act := intgXMySQLColumn(t, drv, "intg_xddl_models", "active"); act["COLUMN_TYPE"] != "tinyint(1)" {

@@ -122,6 +122,13 @@ ddls, err := xormdriver.MigrateSQL(cfg, models...) // []string，待执行 DDL �
 已固化：`TestPGXormMigrate_MigrateSQLDryRun` / `TestMySQLXormMigrate_MigrateSQLClone` /
 `TestMSSQLXormMigrate_MigrateSQLDryRun`（有 diff 返回 ALTER 且结构未变；无 diff 返回空）。
 
+**引擎构造对齐（BUG-1）**：MigrateSQL 的预览引擎与 NewXormDriver 走同一
+`newConfiguredEngine`（TablePrefix / Schema / GonicMapper / TagIdentifier 全部
+对齐）——漏配 ColumnMapper 时列名回退 SnakeMapper，`UserID` 被解析成
+`user_i_d` 假列，每次预览都多出 `ADD COLUMN`（mssql 的 `?` → `@pN` 改写
+仅 capture 驱动需要，属实现细节）。已固化
+`TestPGXormMigrateBUG1_MigrateSQLMapperAligned`。
+
 ### 4.2 索引收敛
 
 **Sync2 行为**：按索引名判存在（`IsIndexExist`），同名即跳过、**不校验定义**——
@@ -150,6 +157,12 @@ err = drv.AutoMigrate(models...)
 落库名（`IDX_<table>_<name>` / `UQE_<table>_<name>`；已带 `IDX_`/`UQE_` 前缀的名
 字原样）。已固化 `TestPGXormMigrate_IndexConvergence`（异构→收敛→missing→补建）。
 
+**大小写不敏感匹配（BUG-4）**：gorm 建成的库索引名为小写（`idx_<table>_<col>`），
+而 XName 为大写前缀（`IDX_...`）。pg 侧按 EqualFold 回退匹配（`ActualName`
+记录库内实际名，供按真实名 DROP）；mysql/mssql 读取侧统一小写键。对齐 Sync2
+的 `Index.Equal` 语义（只比类型+列，不比名字）。stitch-mes 实测曾因此误报
+249 条 missing。已固化 `TestPGXormMigrateBUG4_CheckIndexesCaseInsensitive`。
+
 ### 4.3 列类型收敛（Sync2 不改已有列类型）
 
 **Sync2 行为**：列按名比对，同名列的类型/长度变化**静默跳过**（xorm v1.4.1
@@ -166,9 +179,68 @@ err = drv.AutoMigrate(models...)
    - mssql：`ALTER TABLE [t] ALTER COLUMN [c] <sqltype> NULL/NOT NULL`；
 3. 语句在 Sync2 同一事务内执行（Dry-run 模式下被 capture 记录后随回滚不落库）。
 
-**收敛范围**：类型/长度/精度/NOT NULL；**默认值与注释差异不收敛**（避免重建列
-的数据风险，见 §2 白名单）。MigrateSQL 同样包含收敛语句（Dry-run 可见全部
-待执行 DDL）。
+**收敛范围**：类型/长度/精度/NOT NULL，以及 pg 的列注释（§4.4，仅新增/更新、
+绝不清空）；**默认值差异不收敛**（避免重建列的数据风险，见 §2 白名单）。
+MigrateSQL 同样包含收敛语句（Dry-run 可见全部待执行 DDL）。
+
+### 4.4 列注释：Sync2 清空陷阱与收敛语义（BUG-3）
+
+**Sync2 行为**：列循环对 `col.Comment != oriCol.Comment` 的列发
+`ModifyColumnSQL`——pg 方言固定附带 `COMMENT ON COLUMN x IS ''`，**把库内
+已有注释清空**；legacy 库（gorm/手写 SQL 建成、模型 orm tag 无 comment）上
+每次迁移都产生假阳性 ALTER（stitch-mes 实测 544 条）。
+
+框架侧修复（migrate_comment.go）：
+
+1. **中性化**：Sync2 前把引擎缓存 TableInfo 中已存在表的列注释改写为库内实际
+   值（pg 经 pg_attribute + pg_description；mysql 的 information_schema 主查询
+   自带 column_comment；mssql 无列注释不支持）→ Sync2 的 comment 分支不再触发；
+   新表不改写（保留模型注释建表）。
+2. **收敛**：Sync2 后恢复模型原注释，对比库内实际值生成 `COMMENT ON COLUMN`
+   语句——**仅新增/更新，绝不清空**（库有注释、模型无 → 不动；模型有注释、
+   库无或不同 → 落模型值）。mysql 纯注释差异不收敛（MODIFY COLUMN 重建列有
+   数据风险）；mssql 不收敛。
+
+语义取舍：模型是注释的唯一事实源，但收敛只增不改清——迁移永不丢注释。
+已固化 `TestPGXormMigrateBUG3_CommentNeutralize` /
+`TestPGXormMigrateBUG3_CommentConverge`。
+
+### 4.5 唯一约束收敛：2BP01 根治（BUG-2）
+
+**Sync2 行为**：pg 方言 GetIndexes 从 pg_indexes 读实际索引，gorm `unique`
+建成的 **unique constraint 其支撑索引同样可见**并被判为 UniqueType；Sync2 的
+drop 循环对"未被模型 `Index.Equal` 标记 found"的实际索引一律发
+`DROP INDEX`——对 unique constraint 报 **2BP01**（cannot drop index … because
+constraint … requires it）中断整个迁移。更隐蔽的是标记算法：oriTable.Indexes
+为 map、迭代顺序随机，且内层"首匹配"不跳过已标记项——**同列重复的
+constraint + 普通索引**（历史遗留，如 `uni_*` 与 `idx_*` 同列并存）会被
+随机删掉一个，挑中约束才崩，踩中与否每次运行都不确定。
+
+框架侧修复（planUniqueConstraints + injectGhostIndexes，仅 pgx；mysql 的
+unique 即索引、DROP INDEX 无碍；mssql 约束即索引）：
+
+- **计划**：按 Equal 签名（unique 标志 + 列集合，顺序/大小写不敏感）把实际索引
+  分组；含约束的组中，"模型无同签名索引"或"组内成员 >1"的约束进入预删计划
+  （`ALTER TABLE … DROP CONSTRAINT IF EXISTS`，确定性升序）。被模型匹配且无
+  重复的健康约束零开销保留。
+- **真实路径**（AutoMigrate 默认前置）：计划在 Sync2 前**事务外逐条自动提交**
+  （不能放进 Sync2 的事务：未提交的 ACCESS EXCLUSIVE 会被 Sync2 元数据加载
+  的第二连接撞上，跨连接自死锁，实测确认）。
+- **Dry-run**（MigrateSQL）：事务内**不执行** DROP CONSTRAINT（同理规避自
+  死锁），改为向 TableInfo 注入**幽灵索引**（与 neutralizeComments 同机制）
+  把组内实际索引标记为 found，使 Sync2 跳过 DROP INDEX；计划的 DROP
+  CONSTRAINT 语句在输出中前置拼接，case-b 组（模型匹配但重复）的幻影
+  DROP INDEX 经 phantomDrops 过滤——预览与真实执行确定性一致。幽灵首匹配
+  竞态的残留由 2BP01 重试兜底（≤10 次，失败尝试的 capture 语句截断重录；
+  Sync2 每次重试重读元数据，已完成 DDL 在事务内可见并跳过，断点续迁语义）。
+
+已固化 `TestPGXormMigrateBUG2_UniqueConstraintPreDrop` /
+`TestPGXormMigrateBUG2_MigrateSQLPreview`。
+
+**已知残留**：同签名重复**普通索引**组（无语义影响、不崩溃）由 Sync2 随机
+留一，预览中具体 DROP 哪个名字可能跨次变化，落地状态一致；超表（hypertable）
+上的索引 drop + create 走非 CONCURRENTLY，大表会阻塞写，建议低峰执行或手工
+改 CONCURRENTLY。
 
 ## 5. contracts.Driver.AutoMigrate 双驱动语义差异（R5）
 
@@ -195,3 +267,14 @@ GOFAST_TEST_MYSQL_DSN="user:pass@tcp(host:3306)/" \
 GOFAST_TEST_MSSQL_DSN="server=host;port=1433;user id=sa;password=..." \
   go test -tags integration -run MSSQLXormMigrate ./
 ```
+
+stitch-mes §7 回归固化（真实 PG，migrate_bugfix_integration_test.go）：
+
+```bash
+GOFAST_TEST_PG_DSN="..." go test -tags integration -run PGXormMigrateBUG ./
+```
+
+覆盖：BUG-1 MigrateSQL 引擎构造对齐（GonicMapper，防 user_i_d 假列）、
+BUG-2 唯一约束预删（2BP01 根治，含 dry-run 预览确定性与幂等）、BUG-3 注释
+中性化/收敛（legacy 注释不清空、模型注释落库）、BUG-4 CheckIndexes 大小写
+不敏感（防 idx_*/IDX_* 误报 missing）。

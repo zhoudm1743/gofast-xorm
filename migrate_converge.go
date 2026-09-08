@@ -10,9 +10,12 @@ package xormdriver
 //   - 列类型/长度/数值精度（information_schema.data_type +
 //     character_maximum_length + numeric_precision/scale）
 //   - NOT NULL 约束（is_nullable）
+//   - 列注释（pg：COMMENT ON COLUMN，仅"模型有注释且与库内不同"时生成，
+//     绝不清空已有注释——见 BUG-3 说明；mysql：注释随 MODIFY 渲染，纯注释
+//     差异不收敛；mssql：extended_properties 不收敛）
 //
-// 默认值/注释差异不在本 Pass 收敛（两方言默认值表达式形态差异过大，
-// 属文档化白名单，见 docs/migration.md）。支持 postgres / mysql / mssql。
+// 默认值差异不在本 Pass 收敛（两方言默认值表达式形态差异过大，属文档化
+// 白名单，见 docs/migration.md）。支持 postgres / mysql / mssql。
 //
 // ALTER 语句与 Sync2 在同一事务内执行（schema 模式的 sync2 事务），
 // MigrateSQL Dry-run 同样捕获本 Pass 的语句。
@@ -34,6 +37,7 @@ type colExpect struct {
 	numPrec  *int64 // numeric_precision 期望；nil 不比对
 	numScale *int64 // numeric_scale 期望；nil 不比对
 	nullable bool
+	comment  string // 期望列注释；空串表示模型未声明
 }
 
 // int64Ptr 便捷构造 *int64。
@@ -163,7 +167,7 @@ var numPrecTypes = map[string]bool{
 
 // expectColumn 计算单列期望（information_schema 口径）。
 func expectColumn(engineName string, col *schemas.Column) colExpect {
-	exp := colExpect{nullable: col.Nullable}
+	exp := colExpect{nullable: col.Nullable, comment: col.Comment}
 	dataType, ok := infoSchemaTypeNames[engineName][col.SQLType.Name]
 	if !ok {
 		return exp // 未知类型：跳过类型比对（仍比对 nullable）
@@ -188,6 +192,7 @@ type actualColumn struct {
 	numPrec  *int64
 	numScale *int64
 	nullable bool
+	comment  string // 库内实际列注释（pg 经 pg_description；mysql 经 column_comment；mssql 恒空）
 }
 
 // convergeStatements 计算 models 的列收敛 ALTER 语句列表（不含执行）。
@@ -229,7 +234,12 @@ func convergeStatements(e *xorm.Engine, engineName, schema string, models []any)
 // 占位符统一用 `?`：go-mssqldb 在 Prepare 时经 querytext.ParseParams 转换，
 // pgx stdlib / go-sql-driver 原生认 `?`（xorm 不重绑定占位符）。
 func loadActualColumns(e *xorm.Engine, engineName, schema, table string) (map[string]actualColumn, error) {
-	query := `SELECT column_name, data_type, character_maximum_length, numeric_precision, numeric_scale, is_nullable
+	query := `SELECT column_name, data_type, character_maximum_length, numeric_precision, numeric_scale, is_nullable`
+	if engineName == "mysql" {
+		// mysql 列注释随 information_schema.columns 主查询带出。
+		query += `, column_comment`
+	}
+	query += `
 		FROM information_schema.columns WHERE table_name = ?`
 	var args []any
 	switch engineName {
@@ -265,6 +275,71 @@ func loadActualColumns(e *xorm.Engine, engineName, schema, table string) (map[st
 			numPrec:  bytesToInt64Ptr(row["numeric_precision"]),
 			numScale: bytesToInt64Ptr(row["numeric_scale"]),
 			nullable: string(row["is_nullable"]) == "YES",
+			comment:  string(row["column_comment"]), // mysql 带出；pg/mssql 为 ""
+		}
+	}
+	// 列注释（pg：information_schema 无注释列，单独走 pg_description；
+	// mysql：column_comment 随主查询带出；mssql：不收敛注释）。
+	if engineName == "pgx" {
+		comments, err := loadActualComments(e, engineName, schema, table)
+		if err != nil {
+			return nil, err
+		}
+		for k, c := range comments {
+			if ac, ok := out[k]; ok {
+				ac.comment = c
+				out[k] = ac
+			}
+		}
+	}
+	return out, nil
+}
+
+// loadActualComments 读取目标表实际列注释（小写列名 → 注释；无注释列缺省 ""）。
+// pg：pg_attribute + pg_description（schema 为空取 current_schema()）；
+// mysql：information_schema.columns.column_comment；mssql 返回空表（不支持）。
+func loadActualComments(e *xorm.Engine, engineName, schema, table string) (map[string]string, error) {
+	out := map[string]string{}
+	switch engineName {
+	case "pgx":
+		var (
+			rows []map[string][]byte
+			err  error
+		)
+		if schema != "" {
+			rows, err = e.Query(
+				`SELECT a.attname AS column_name, d.description AS comment
+				 FROM pg_attribute a
+				 JOIN pg_class c ON a.attrelid = c.oid
+				 JOIN pg_namespace n ON c.relnamespace = n.oid
+				 LEFT JOIN pg_description d ON d.objoid = c.oid AND d.objsubid = a.attnum
+				 WHERE n.nspname = ? AND c.relname = ? AND a.attnum > 0 AND NOT a.attisdropped`,
+				schema, table)
+		} else {
+			rows, err = e.Query(
+				`SELECT a.attname AS column_name, d.description AS comment
+				 FROM pg_attribute a
+				 JOIN pg_class c ON a.attrelid = c.oid
+				 LEFT JOIN pg_description d ON d.objoid = c.oid AND d.objsubid = a.attnum
+				 WHERE c.relname = ? AND a.attnum > 0 AND NOT a.attisdropped
+				   AND c.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = current_schema())`,
+				table)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("xormdriver: 读取 pg_description 列注释失败: %w", err)
+		}
+		for _, row := range rows {
+			out[strings.ToLower(string(row["column_name"]))] = string(row["comment"])
+		}
+	case "mysql":
+		rows, err := e.Query(
+			`SELECT column_name, column_comment FROM information_schema.columns
+			 WHERE table_schema = DATABASE() AND table_name = ?`, table)
+		if err != nil {
+			return nil, fmt.Errorf("xormdriver: 读取 column_comment 失败: %w", err)
+		}
+		for _, row := range rows {
+			out[strings.ToLower(string(row["column_name"]))] = string(row["column_comment"])
 		}
 	}
 	return out, nil
@@ -291,14 +366,19 @@ func equalInt64Ptr(a, b *int64) bool {
 }
 
 // buildConvergeStmts 单列差异 → ALTER 语句（方言相关）。
+// 注释差异：仅"模型有注释且与库内不同"时收敛（pg 生成 COMMENT ON COLUMN；
+// mysql 走 MODIFY COLUMN 由 ColumnString 渲染注释）；模型无注释而库内有
+// 一律不动——绝不生成清空注释的语句（BUG-3，stitch-mes 实测：Sync2 的
+// ModifyColumnSQL 附 COMMENT IS ” 会清空 gorm/手工 SQL 建的 700 条注释）。
 func buildConvergeStmts(e *xorm.Engine, engineName, schema, table string, col *schemas.Column, act actualColumn) []string {
 	exp := expectColumn(engineName, col)
 	typeDiff := exp.dataType != "" && exp.dataType != act.dataType
 	lenDiff := !equalInt64Ptr(exp.charLen, act.charLen)
 	precDiff := !equalInt64Ptr(exp.numPrec, act.numPrec) || !equalInt64Ptr(exp.numScale, act.numScale)
 	nullableDiff := exp.nullable != act.nullable
+	commentDiff := exp.comment != "" && exp.comment != act.comment
 
-	if !typeDiff && !lenDiff && !precDiff && !nullableDiff {
+	if !typeDiff && !lenDiff && !precDiff && !nullableDiff && !commentDiff {
 		return nil
 	}
 	switch engineName {
@@ -315,16 +395,27 @@ func buildConvergeStmts(e *xorm.Engine, engineName, schema, table string, col *s
 			}
 			out = append(out, fmt.Sprintf(`ALTER TABLE %s ALTER COLUMN "%s" %s`, qtbl, col.Name, kw))
 		}
+		if commentDiff {
+			out = append(out, fmt.Sprintf(`COMMENT ON COLUMN %s."%s" IS '%s'`, qtbl, col.Name, escapeSQLString(exp.comment)))
+		}
 		return out
 	case "mysql":
 		// MODIFY COLUMN 需给出完整列定义（类型/nullable/默认值/注释），
-		// 由 xorm ColumnString 统一渲染。
+		// 由 xorm ColumnString 统一渲染。纯注释差异不收敛：为重写注释而整列
+		// MODIFY 有默认值漂移风险，代价大于收益（pg 的 COMMENT 语句是元数据
+		// 操作，无此问题，故 pg 收敛纯注释差异）。
+		if !typeDiff && !lenDiff && !precDiff && !nullableDiff {
+			return nil
+		}
 		colDef, err := dialects.ColumnString(e.Dialect(), col, false, false)
 		if err != nil {
 			return nil
 		}
 		return []string{fmt.Sprintf("ALTER TABLE `%s` MODIFY COLUMN %s", table, colDef)}
 	case "mssql":
+		if commentDiff {
+			return nil // mssql 注释（extended_properties）不收敛
+		}
 		qtbl := quoteMSSQLTable(schema, table)
 		nullKW := "NULL"
 		if !exp.nullable {
@@ -339,6 +430,9 @@ func buildConvergeStmts(e *xorm.Engine, engineName, schema, table string, col *s
 	}
 	return nil
 }
+
+// escapeSQLString SQL 字符串字面量转义（单引号加倍）。
+func escapeSQLString(s string) string { return strings.ReplaceAll(s, "'", "''") }
 
 // quotePGTable PG 表名引用（schema 非空时两段引用）。
 func quotePGTable(schema, table string) string {
