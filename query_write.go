@@ -3,6 +3,7 @@ package xormdriver
 import (
 	"fmt"
 	"reflect"
+	"time"
 
 	"github.com/zhoudm1743/go-fast-framework/contracts"
 
@@ -32,11 +33,13 @@ import (
 // 此处沿用 q.build(value)（保留链上条件）：Save 的 0 行回落插入依赖显式
 // 条件过滤回落行（TestXormSaveResultWithExplicitCond 锁定）——故条件剥离
 // 仅用于 FirstOrCreate 的插入路径（buildInsertSession），不动本函数。
+// 软删存活过滤（sd 模型）不随 INSERT 下发（xorm 携带 Where 的 Insert 静默
+// 影响 0 行），createCore 走 buildNoSd——链上条件照常保留，仅跳过 sd 过滤。
 func (q *XormQuery) createCore(value any) (int64, error) {
 	if err := invokeBeforeCreate(q, value); err != nil {
 		return 0, q.done(err)
 	}
-	s, err := q.build(value)
+	s, err := q.buildNoSd(value)
 	if err != nil {
 		return 0, q.done(err)
 	}
@@ -114,7 +117,7 @@ func (q *XormQuery) CreateInBatches(value any, batchSize int) error {
 			end = rv.Len()
 		}
 		chunk := rv.Slice(start, end).Interface()
-		s, err := q.build(chunk)
+		s, err := q.buildNoSd(chunk)
 		if err != nil {
 			return q.done(err)
 		}
@@ -313,9 +316,21 @@ func (q *XormQuery) applyModelPKCond(s *xorm.Session) {
 }
 
 // mergedWriteCond 返回表达式 UPDATE（builder 组装路径）的完整 WHERE：
-// 链上 condSpecs 与 Model bean 主键条件取 AND 交集。
+// 链上 condSpecs、sd 存活过滤与 Model bean 主键条件取 AND 交集。
+// sd 解析错误不在此处透出——updateWithExpr 后续 build(nil) 经 applySdFilter
+// 统一报错（Exec(builder) 只消费 builder 的 SQL，会话上的 Where 不参与）。
 func (q *XormQuery) mergedWriteCond() builder.Cond {
 	cond := q.buildCond()
+	if !q.unscoped {
+		if sd, err := q.sdOfModel(q.sdLookupTarget()); err == nil && sd != nil {
+			ac := sd.aliveBuilderCond()
+			if cond == nil {
+				cond = ac
+			} else {
+				cond = builder.And(cond, ac)
+			}
+		}
+	}
 	if eq := q.modelPKCond(); len(eq) > 0 {
 		if cond == nil {
 			return eq
@@ -330,18 +345,24 @@ func (q *XormQuery) mergedWriteCond() builder.Cond {
 // 零值主键列跳过而非并入（对齐 gorm 对零值主键不加条件的语义），部分非零的
 // 复合主键只收敛已填充列。
 func (q *XormQuery) modelPKCond() builder.Eq {
-	if q.modelValue == nil {
+	return beanPKCond(q.engine, q.modelValue)
+}
+
+// beanPKCond 提取任意 bean 的非零主键等值条件（Delete 软删改写的条件来源，
+// 与 modelPKCond 同规则，仅 bean 来源不同）。
+func beanPKCond(e *xorm.Engine, value any) builder.Eq {
+	if value == nil {
 		return nil
 	}
-	bean := tableBeanOf(q.modelValue)
+	bean := tableBeanOf(value)
 	if bean == nil {
 		return nil
 	}
-	t, err := q.engine.TableInfo(bean)
+	t, err := e.TableInfo(bean)
 	if err != nil || len(t.PrimaryKeys) == 0 {
 		return nil
 	}
-	rv := reflect.Indirect(reflect.ValueOf(q.modelValue))
+	rv := reflect.Indirect(reflect.ValueOf(value))
 	if rv.Kind() != reflect.Struct {
 		return nil
 	}
@@ -486,6 +507,11 @@ func (q *XormQuery) Updates(values any) error {
 // deleteCore Delete 的公共内核：钩子 → 条件 → 删除 → 失效缓存 → 钩子。
 // value 同时充当表定位 bean（表名兜底/主键条件来源），conds 为 gorm 语义的
 // 附加 Where 条件（conds[0] 条件、其余参数，经 applyConds 应用）。
+//
+// sd 标记模型（框架托管软删）：Delete 自动改写为置位 UPDATE——build 已附加
+// 存活过滤（Unscoped 链经 unscoped 标记跳过过滤并走下方物理删除）；
+// xorm 的 Update 不从 bean 推导表名与 WHERE，此处按 value 推导表名并并入
+// 非零主键等值条件（对齐 s.Delete(value) 的条件来源，X-09 同款）。
 func (q *XormQuery) deleteCore(value any, conds []any) (int64, error) {
 	if err := invokeBeforeDelete(q, value); err != nil {
 		return 0, q.done(err)
@@ -496,6 +522,28 @@ func (q *XormQuery) deleteCore(value any, conds []any) (int64, error) {
 	}
 	if err := applyConds(s, conds); err != nil {
 		return 0, q.done(err)
+	}
+	if !q.unscoped {
+		sd, err := q.sdOfModel(value)
+		if err != nil {
+			return 0, q.done(err)
+		}
+		if sd != nil {
+			if !q.explicitTable {
+				if name, terr := tableInfoName(q.engine, value); terr == nil && name != "" {
+					s.Table(q.schemaTable(name))
+				}
+			}
+			if eq := beanPKCond(q.engine, value); len(eq) > 0 {
+				s.Where(eq)
+			}
+			n, err := s.Update(map[string]any{sd.Column: sd.Sd.DeletedValue(time.Now())})
+			if err != nil {
+				return 0, q.done(err)
+			}
+			q.invalidateCache()
+			return n, q.done(invokeAfterDelete(q, value))
+		}
 	}
 	n, err := s.Delete(value)
 	if err != nil {

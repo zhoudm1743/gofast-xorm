@@ -85,7 +85,7 @@ func (q *XormQuery) savepointIdent(name string) string {
 // SavePoint 在当前事务内创建保存点。名字按方言引号引用（见 savepointIdent）。
 // 与 gormdriver 交由 gorm 方言生成 SAVEPOINT 语句的行为存在差异，此处为显式拼接。
 func (q *XormQuery) SavePoint(name string) error {
-	s, err := q.build(nil)
+	s, err := q.buildNoSd(nil)
 	if err != nil {
 		return q.done(err)
 	}
@@ -97,7 +97,7 @@ func (q *XormQuery) SavePoint(name string) error {
 
 // RollbackTo 回滚到指定保存点，SQL 拼接与方言注意事项同 SavePoint。
 func (q *XormQuery) RollbackTo(name string) error {
-	s, err := q.build(nil)
+	s, err := q.buildNoSd(nil)
 	if err != nil {
 		return q.done(err)
 	}

@@ -181,41 +181,76 @@ func (q *XormQuery) Lock(mode contracts.LockMode) contracts.Query {
 
 // ── 软删除扩展 ───────────────────────────────────────────────────────
 
-// Unscoped 取消软删除过滤，仅对 xorm `deleted` tag 标记的字段生效
-// （xorm 在查询/更新/删除时自动追加该列的未删条件，Unscoped 置位后跳过）。
-// 框架业务级软删除（database.SoftDelete 的 deleted_at 列）不依赖该 tag，
-// 不受本方法影响。
+// Unscoped 取消软删除过滤：
+//   - xorm `deleted` tag 标记的字段：执行期 s.Unscoped() 跳过 xorm 自动追加的
+//     未删条件（原生行为）；
+//   - 框架托管软删除（sd tag 模型）：置链上 unscoped 标记，存活过滤与 Delete
+//     改写据此绕过（文档 §11.9）。
 func (q *XormQuery) Unscoped() contracts.Query {
-	return q.addApplier("unscoped", func(q *XormQuery, s *xorm.Session) error {
+	nq := q.addApplier("unscoped", func(q *XormQuery, s *xorm.Session) error {
 		s.Unscoped()
 		return nil
 	})
+	nq.unscoped = true
+	return nq
 }
 
-// OnlyTrashed 仅查询已软删除的记录（deleted_at != 0）。
-// 列名 "deleted_at" 与 database.SoftDelete.DeletedAt 字段绑定，
-// 若自定义软删除列名需自行实现此逻辑。
+// OnlyTrashed 仅查询已软删除的记录。
+// sd 标记模型（框架托管软删）：按 SdMeta.TrashedCond 类型感知——time 模式
+// IS NOT NULL、flag 模式 = 1、其余整数模式 <> 0，列名取 sd 字段映射列。
+// 未标记模型（旧版业务级）：deleted_at != 0，列名 "deleted_at" 与
+// database.SoftDelete.DeletedAt 字段绑定，若自定义软删除列名需自行实现此逻辑。
 // 执行期先 s.Unscoped() 再挂条件：模型带 xorm `deleted` tag 时 xorm 会在查询
 // 自动追加 "deleted_at = 0" 未删过滤，不与 Unscoped 取消会与 "deleted_at != 0"
 // 取 AND 交集后恒空（分组 5 集成测试暴露）；无 tag 的业务级 deleted_at 列本
 // 就不被 xorm 过滤，Unscoped 置位无副作用，两形态语义统一。
 func (q *XormQuery) OnlyTrashed() contracts.Query {
-	return q.addApplier("onlytrashed", func(q *XormQuery, s *xorm.Session) error {
+	nq := q.addApplier("onlytrashed", func(q *XormQuery, s *xorm.Session) error {
 		s.Unscoped()
+		if sd, err := q.sdOfModel(q.sdLookupTarget()); err != nil {
+			return err
+		} else if sd != nil {
+			cond, args := sd.trashedCond()
+			return applyCondToSession(s, condWhere, cond, args)
+		}
 		return applyCondToSession(s, condWhere, "deleted_at != 0", nil)
 	})
+	// 链上标记 unscoped：OnlyTrashed 本质即"绕过存活过滤 + 只取已删行"，
+	// 否则 buildOpts 的存活过滤会与 TrashedCond 取 AND 后恒空。
+	nq.unscoped = true
+	return nq
 }
 
-// Restore 恢复已软删除记录（deleted_at 置 0）。要求链上已显式 Table/Model：
+// sdLookupTarget OnlyTrashed/Restore 等链式方法的模型定位目标：Model() bean
+// 优先，其次 Table 链无模型时返回 nil（无法类型感知，走旧版语义）。
+func (q *XormQuery) sdLookupTarget() any {
+	if q.modelValue != nil {
+		return q.modelValue
+	}
+	return nil
+}
+
+// Restore 恢复已软删除记录。sd 标记模型类型感知：time 模式写 NULL，整数模式
+// 写 0；未标记模型保持旧版 deleted_at 置 0。要求链上已显式 Table/Model：
 // build(nil) 无 dest 可作表名兜底，裸链执行时 xorm 无法定位表而报错。
 // 无 Where 条件时 xorm 不拦截全表更新（与 gorm 的 ErrMissingWhereClause
 // 不同），恢复范围由调用方保证。写终结成功后失效查询缓存。
 func (q *XormQuery) Restore() error {
-	s, err := q.build(nil)
+	// 恢复对象是已删行，构建会话时必须绕过存活过滤（等价 Unscoped 语义，
+	// 但不改调用方链上的标记）。
+	nq := q.clone()
+	nq.unscoped = true
+	s, err := nq.build(nil)
 	if err != nil {
 		return q.done(err)
 	}
-	if _, err := s.Update(map[string]any{"deleted_at": 0}); err != nil {
+	restoreCol, restoreVal := "deleted_at", any(int64(0))
+	if sd, err := q.sdOfModel(q.sdLookupTarget()); err != nil {
+		return q.done(err)
+	} else if sd != nil {
+		restoreCol, restoreVal = sd.Column, sd.Sd.AliveValue()
+	}
+	if _, err := s.Update(map[string]any{restoreCol: restoreVal}); err != nil {
 		return q.done(err)
 	}
 	q.invalidateCache()
@@ -229,7 +264,10 @@ func (q *XormQuery) Restore() error {
 // 与 gormdriver 一致不触发 Before/AfterDelete 钩子——钩子面向业务级软删除
 // 的 Delete 路径。写终结成功后失效查询缓存。
 func (q *XormQuery) ForceDelete(value any, conds ...any) error {
-	s, err := q.build(value)
+	// 物理删除须绕过框架托管软删的存活过滤（否则只删到存活行，已删行残留）。
+	nq := q.clone()
+	nq.unscoped = true
+	s, err := nq.build(value)
 	if err != nil {
 		return q.done(err)
 	}

@@ -33,6 +33,7 @@ import (
 	"math"
 	"reflect"
 	"strings"
+	"sync"
 
 	"github.com/zhoudm1743/go-fast-framework/contracts"
 
@@ -50,6 +51,10 @@ type XormDriver struct {
 	qc             *queryCache   // 查询缓存；EnableCaches 后非 nil（见 cacher.go）
 	rebuildIndexes bool          // WithRebuildIndexes：Sync2 前 drop 同名异构索引（migrate.go）
 	log            contracts.Log // 框架日志器（AutoMigrate 启动期校验告警用；构造时 nil 已降级 discardLog）
+
+	// sdFields 框架托管软删字段注册表（sd tag，§11.9）：reflect.Type →
+	// *sdFieldMeta 或 error（解析失败缓存），查询期惰性写入。
+	sdFields sync.Map
 }
 
 // ── 查询构建器 ───────────────────────────────────────────────────────
@@ -91,6 +96,14 @@ type XormQuery struct {
 
 	rawSQL  string // Raw() 记录的原生 SQL（Row/Rows 原生路径使用）
 	rawArgs []any
+
+	// sdFields 驱动级软删注册表（Query() 注入指针，wrap 拷贝共享；nil 安全，
+	// 直接构造 XormQuery 的测试场景按未启用软删处理）。
+	sdFields *sync.Map
+
+	// unscoped 链上已调用 Unscoped()（框架托管软删的 Delete 改写与存活
+	// 过滤以此为绕过标记；xorm Session 的 Unscoped 由执行期 applier 应用）。
+	unscoped bool
 
 	preloads []preloadSpec // Preload() 声明的关联预加载（query_preload.go），终结成功后回填
 
@@ -138,15 +151,22 @@ func (q *XormQuery) clone() *XormQuery {
 
 // ── 执行期构建 ───────────────────────────────────────────────────────
 
-// build 构建（或复用事务）session，按序应用上下文、表名兜底、分页与链式条件。
-// dest 用于表名兜底推导；无 dest 的场景传 nil。
+// build 构建（或复用事务）session，按序应用上下文、表名兜底、分页、链式条件
+// 与框架托管软删存活过滤。dest 用于表名兜底推导；无 dest 的场景传 nil。
 func (q *XormQuery) build(dest any) (*xorm.Session, error) {
-	return q.buildOpts(dest, false)
+	return q.buildOpts(dest, false, false)
+}
+
+// buildNoSd 同 build，但不附加软删存活过滤——供 Scan/ScanMap 等原生扫描
+// 路径使用（与 gormdriver Scan 走 Rows 回调绕过软删过滤的口径对齐）。
+func (q *XormQuery) buildNoSd(dest any) (*xorm.Session, error) {
+	return q.buildOpts(dest, false, true)
 }
 
 // buildOpts 同 build；skipOrder 用于 Count 剥离 ORDER BY——聚合列不在排序列
-// 集合内时 PG 严格模式报 42803，且 gorm Count 本就丢弃排序（X-06）。
-func (q *XormQuery) buildOpts(dest any, skipOrder bool) (*xorm.Session, error) {
+// 集合内时 PG 严格模式报 42803，且 gorm Count 本就丢弃排序（X-06）；
+// skipSdFilter 用于 Scan/ScanMap 原生扫描路径（见 buildNoSd）。
+func (q *XormQuery) buildOpts(dest any, skipOrder, skipSdFilter bool) (*xorm.Session, error) {
 	if q.err != nil {
 		return nil, q.err
 	}
@@ -169,6 +189,13 @@ func (q *XormQuery) buildOpts(dest any, skipOrder bool) (*xorm.Session, error) {
 	q.applyLimit(s)
 	for _, ap := range q.appliers {
 		if err := ap(q, s); err != nil {
+			return nil, err
+		}
+	}
+	if !skipSdFilter {
+		// 框架托管软删存活过滤（sd 模型，Unscoped 绕过）：置于链式条件之后、
+		// ORDER BY 之前（AND 语义，顺序无关）。
+		if err := q.applySdFilter(s, dest); err != nil {
 			return nil, err
 		}
 	}

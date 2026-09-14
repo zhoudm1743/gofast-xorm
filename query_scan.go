@@ -40,7 +40,9 @@ var (
 // 字段不作为自动条件（MergeConds），dest 复用不会静默收窄查询范围。
 func (q *XormQuery) Scan(dest any) error {
 	err := q.withCache(dest, func() error {
-		s, err := q.build(dest)
+		// 原生扫描路径绕过软删存活过滤（与 gormdriver Scan 走 Rows 回调
+		// 绕过软删 QueryClauses 的口径对齐，双驱动一致）。
+		s, err := q.buildNoSd(dest)
 		if err != nil {
 			return err
 		}
@@ -134,7 +136,8 @@ func (q *XormQuery) Pluck(column string, dest any) error {
 // 原样保留。dest 追加而非替换，与 gorm 驱动行为对齐。
 func (q *XormQuery) ScanMap(dest *[]map[string]any) error {
 	err := q.withCache(dest, func() error {
-		s, err := q.build(nil)
+		// 原生扫描路径绕过软删存活过滤（与 Scan/Row/Rows 口径一致）。
+		s, err := q.buildNoSd(nil)
 		if err != nil {
 			return err
 		}
@@ -227,7 +230,7 @@ func (q *XormQuery) Rows() (contracts.Rows, error) {
 // 会改变数据，缓存若不失效将读到旧值（gorm 驱动由 go-gorm/caches 插件在
 // 回调层失效，此处为自研缓存的等价语义）。
 func (q *XormQuery) Exec(sql string, values ...any) error {
-	s, err := q.build(nil)
+	s, err := q.buildNoSd(nil)
 	if err != nil {
 		return q.done(err)
 	}
@@ -245,7 +248,7 @@ func (q *XormQuery) Exec(sql string, values ...any) error {
 // 可经 IsZeroRow 判定。事务内复用事务 session，与 Exec 同路径；
 // 成功后失效查询缓存（写终结语义与 Exec 一致）。
 func (q *XormQuery) ExecResult(sql string, values ...any) contracts.Result {
-	s, err := q.build(nil)
+	s, err := q.buildNoSd(nil)
 	if err != nil {
 		return contracts.Result{Error: q.done(err)}
 	}

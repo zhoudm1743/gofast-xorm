@@ -114,7 +114,7 @@ func (q *XormQuery) Count(count *int64) error {
 	return q.done(q.withCache(count, func() error {
 		// Count 剥离链上 ORDER BY：聚合列不在排序列集合内时 PG 报 42803，
 		// 且排序对行数无意义（gorm Count 同样丢弃，X-06）。
-		s, err := q.buildOpts(nil, true)
+		s, err := q.buildOpts(nil, true, false)
 		if err != nil {
 			return err
 		}

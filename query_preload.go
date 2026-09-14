@@ -3,6 +3,8 @@ package xormdriver
 import (
 	"fmt"
 	"reflect"
+	"strings"
+	"sync"
 
 	"github.com/zhoudm1743/go-fast-framework/contracts"
 	"github.com/zhoudm1743/go-fast-framework/database/preload"
@@ -79,7 +81,7 @@ func (q *XormQuery) runPreloads(dest any) error {
 // 元数据缓存随引擎生命周期内复用）。
 func newPreloadEngine(q *XormQuery) *preload.Engine {
 	return &preload.Engine{
-		Meta: &xormMetaAdapter{engine: q.engine},
+		Meta: &xormMetaAdapter{engine: q.engine, sdFields: q.sdFields},
 		NewQuery: func() contracts.Query {
 			// 子查询状态继承（对齐原 preloadLevel 子查询构造清单）：engine/
 			// tx/schema/ctx/查询缓存配置；不继承父链 Where 条件、显式表名/
@@ -92,6 +94,7 @@ func newPreloadEngine(q *XormQuery) *preload.Engine {
 				ctx:      q.ctx,
 				qc:       q.qc,
 				cacheCfg: q.cacheCfg,
+				sdFields: q.sdFields,
 			}
 		},
 	}
@@ -104,7 +107,8 @@ func newPreloadEngine(q *XormQuery) *preload.Engine {
 // mapper 与 TableName() 接口，与原实现 schemaTable(childTI.Name) 语义一致），
 // 均为数据库裸名，不含 schema 前缀（前缀由 NewQuery 闭包经 schemaTable 拼接）。
 type xormMetaAdapter struct {
-	engine *xorm.Engine
+	engine   *xorm.Engine
+	sdFields *sync.Map // 框架托管软删注册表（SoftDeleteCond 用，可为 nil）
 }
 
 // tableOf 解析模型类型对应的表元数据（TableInfo 缓存由 xorm 引擎维护）。
@@ -151,6 +155,38 @@ func (m *xormMetaAdapter) HasColumn(modelType reflect.Type, columnName string) b
 		return false
 	}
 	return ti.GetColumn(columnName) != nil
+}
+
+// SoftDeleteColumn 业务级软删列（int64 deleted_at 约定，0=存活）的列名；
+// ok=false 表示无业务级软删列——含 xorm 原生 deleted tag 标记的列（其过滤由
+// xorm 自身在类型化查询上追加，引擎不重复添加）。
+func (m *xormMetaAdapter) SoftDeleteColumn(modelType reflect.Type) (string, bool) {
+	ti, err := m.tableOf(modelType)
+	if err != nil {
+		return "", false
+	}
+	col := ti.GetColumn("deleted_at")
+	if col == nil || col.IsDeleted || !isIntegerSQLType(col.SQLType) {
+		return "", false
+	}
+	return col.Name, true
+}
+
+// SoftDeleteCond sd 模型（框架托管软删）的类型感知存活条件（time 模式
+// IS NULL，整数模式 = 0）；非 sd 模型或解析失败返回 ok=false，引擎回退
+// SoftDeleteColumn 的 int64 约定。
+func (m *xormMetaAdapter) SoftDeleteCond(modelType reflect.Type) (string, []any, bool) {
+	sd, err := sdOfModel(m.engine, m.sdFields, reflect.New(modelType).Interface())
+	if err != nil || sd == nil {
+		return "", nil, false
+	}
+	cond, args := sd.aliveCond()
+	return cond, args, true
+}
+
+// isIntegerSQLType SQLType 是否整数族（int/bigint/tinyint 等，大小写不敏感）。
+func isIntegerSQLType(st schemas.SQLType) bool {
+	return strings.Contains(strings.ToLower(st.Name), "int")
 }
 
 // columnOfFieldName 按结构体字段名在表元数据中定位列。

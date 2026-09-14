@@ -170,7 +170,7 @@ func applyEngineNaming(cfg contracts.ConnectionConfig, engine *xorm.Engine) {
 
 // Query 创建新的查询构建器实例；可传入 context 用于超时/取消与链路追踪。
 func (d *XormDriver) Query(ctx ...context.Context) contracts.Query {
-	q := &XormQuery{engine: d.engine, schema: d.schema, qc: d.qc}
+	q := &XormQuery{engine: d.engine, schema: d.schema, qc: d.qc, sdFields: &d.sdFields}
 	if len(ctx) > 0 && ctx[0] != nil {
 		q.ctx = ctx[0]
 	}
