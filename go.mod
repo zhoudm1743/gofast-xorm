@@ -7,7 +7,7 @@ require (
 	github.com/go-sql-driver/mysql v1.8.1
 	github.com/jackc/pgx/v5 v5.6.0
 	github.com/microsoft/go-mssqldb v1.8.2
-	github.com/zhoudm1743/go-fast-framework v1.0.0
+	github.com/zhoudm1743/go-fast-framework v1.1.0
 	xorm.io/builder v0.3.13
 	xorm.io/xorm v1.4.1
 )
